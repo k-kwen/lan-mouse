@@ -17,6 +17,7 @@ use input_event::{
 use keycode::{KeyMap, KeyMapping};
 use std::cell::Cell;
 use std::collections::HashSet;
+use std::ffi::c_void;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -155,6 +156,246 @@ extern "C" {
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     fn AXIsProcessTrusted() -> bool;
+}
+
+// Text Input Source (TIS) bindings for direct IME switching. macOS rejects
+// synthetic input-source shortcuts (e.g. Ctrl+Space, F18) coming from
+// CGEventPost, so we toggle the input source programmatically instead.
+type TISInputSourceRef = *const c_void;
+type CFStringRef = *const c_void;
+type CFArrayRef = *const c_void;
+type CFIndex = isize;
+
+const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+
+// TIS symbols live in Carbon.framework/Frameworks/HIToolbox.framework.
+// The SDK forbids linking HIToolbox directly, and the C-side static
+// `kTISPropertyInputSourceID` is bound eagerly by dyld at process start,
+// before any user code can dlopen the subframework. So everything—both
+// the function symbols and the property-key constant—is resolved at
+// runtime via dlsym after the first dlopen.
+unsafe extern "C" {
+    fn dlopen(path: *const std::ffi::c_char, mode: i32) -> *mut c_void;
+    fn dlsym(handle: *mut c_void, sym: *const std::ffi::c_char) -> *mut c_void;
+    fn dlerror() -> *const std::ffi::c_char;
+}
+const RTLD_LAZY: i32 = 1;
+const RTLD_DEFAULT: *mut c_void = -2isize as *mut c_void;
+
+type FnTisCopyCurrent = unsafe extern "C" fn() -> TISInputSourceRef;
+type FnTisCopyForLanguage = unsafe extern "C" fn(CFStringRef) -> TISInputSourceRef;
+type FnTisCreateList = unsafe extern "C" fn(*const c_void, bool) -> CFArrayRef;
+type FnTisGetProperty = unsafe extern "C" fn(TISInputSourceRef, CFStringRef) -> *const c_void;
+type FnTisSelect = unsafe extern "C" fn(TISInputSourceRef) -> i32;
+
+struct TisApi {
+    copy_current: FnTisCopyCurrent,
+    copy_for_language: FnTisCopyForLanguage,
+    create_list: Option<FnTisCreateList>,
+    get_property: FnTisGetProperty,
+    select: FnTisSelect,
+    property_input_source_id: CFStringRef,
+}
+
+unsafe impl Send for TisApi {}
+unsafe impl Sync for TisApi {}
+
+static TIS: std::sync::OnceLock<Option<TisApi>> = std::sync::OnceLock::new();
+
+fn tis_api() -> Option<&'static TisApi> {
+    TIS.get_or_init(|| unsafe {
+        let path = c"/System/Library/Frameworks/Carbon.framework/Versions/Current/Frameworks/HIToolbox.framework/HIToolbox";
+        let handle = dlopen(path.as_ptr(), RTLD_LAZY);
+        if handle.is_null() {
+            let err = dlerror();
+            let msg = if err.is_null() {
+                "<no dlerror>".to_string()
+            } else {
+                let mut len = 0;
+                while *err.add(len) != 0 {
+                    len += 1;
+                }
+                std::str::from_utf8(std::slice::from_raw_parts(err as *const u8, len))
+                    .unwrap_or("<invalid utf8>")
+                    .to_string()
+            };
+            log::warn!("TIS: dlopen HIToolbox failed: {msg}; falling back to RTLD_DEFAULT");
+        }
+        let lookup_handle = if handle.is_null() { RTLD_DEFAULT } else { handle };
+
+        let copy_current = dlsym(lookup_handle, c"TISCopyCurrentKeyboardInputSource".as_ptr());
+        let copy_for_lang = dlsym(lookup_handle, c"TISCopyInputSourceForLanguage".as_ptr());
+        // Current SDKs no longer export TISCopyInputSourceList, but the
+        // older TISCreateInputSourceList alias is still available.
+        let mut create_list = dlsym(lookup_handle, c"TISCreateInputSourceList".as_ptr());
+        if create_list.is_null() {
+            create_list = dlsym(lookup_handle, c"TISCopyInputSourceList".as_ptr());
+        }
+        let get_property = dlsym(lookup_handle, c"TISGetInputSourceProperty".as_ptr());
+        let select = dlsym(lookup_handle, c"TISSelectInputSource".as_ptr());
+        let id_var = dlsym(lookup_handle, c"kTISPropertyInputSourceID".as_ptr());
+
+        if copy_current.is_null()
+            || copy_for_lang.is_null()
+            || get_property.is_null()
+            || select.is_null()
+            || id_var.is_null()
+        {
+            log::warn!("TIS: required symbols missing; IME toggle disabled");
+            return None;
+        }
+
+        // id_var is a pointer to the static CFStringRef variable.
+        let property_input_source_id = *(id_var as *const CFStringRef);
+
+        Some(TisApi {
+            copy_current: std::mem::transmute::<*mut c_void, FnTisCopyCurrent>(copy_current),
+            copy_for_language: std::mem::transmute::<*mut c_void, FnTisCopyForLanguage>(
+                copy_for_lang,
+            ),
+            create_list: if create_list.is_null() {
+                None
+            } else {
+                Some(std::mem::transmute::<*mut c_void, FnTisCreateList>(
+                    create_list,
+                ))
+            },
+            get_property: std::mem::transmute::<*mut c_void, FnTisGetProperty>(get_property),
+            select: std::mem::transmute::<*mut c_void, FnTisSelect>(select),
+            property_input_source_id,
+        })
+    })
+    .as_ref()
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFRelease(cf: *const c_void);
+    fn CFStringGetCString(s: CFStringRef, buf: *mut u8, len: CFIndex, encoding: u32) -> bool;
+    fn CFStringCreateWithCString(
+        alloc: *const c_void,
+        c_str: *const u8,
+        encoding: u32,
+    ) -> CFStringRef;
+    fn CFArrayGetCount(arr: CFArrayRef) -> CFIndex;
+    fn CFArrayGetValueAtIndex(arr: CFArrayRef, idx: CFIndex) -> *const c_void;
+}
+
+fn cfstring_from(s: &str) -> CFStringRef {
+    let mut bytes = s.as_bytes().to_vec();
+    bytes.push(0);
+    unsafe {
+        CFStringCreateWithCString(std::ptr::null(), bytes.as_ptr(), K_CF_STRING_ENCODING_UTF8)
+    }
+}
+
+fn input_source_id(api: &TisApi, source: TISInputSourceRef) -> Option<String> {
+    unsafe {
+        let id_ref = (api.get_property)(source, api.property_input_source_id);
+        if id_ref.is_null() {
+            return None;
+        }
+        let mut buf = [0u8; 256];
+        if !CFStringGetCString(
+            id_ref as CFStringRef,
+            buf.as_mut_ptr(),
+            buf.len() as CFIndex,
+            K_CF_STRING_ENCODING_UTF8,
+        ) {
+            return None;
+        }
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        std::str::from_utf8(&buf[..end]).ok().map(|s| s.to_string())
+    }
+}
+
+/// Toggle between a Korean input source and a roman keyboard layout.
+/// Inspects the currently selected source's ID; if Korean, switches to en
+/// via TISCopyInputSourceForLanguage. Korean direction requires a selectable
+/// *input mode* (e.g. com.apple.inputmethod.Korean.2SetKorean), which is only
+/// reachable through the enabled-source list — TISCopyInputSourceForLanguage
+/// returns the parent input *method* (com.apple.inputmethod.Korean) and
+/// TISSelectInputSource rejects it with paramErr.
+fn toggle_korean_input_source() {
+    let Some(api) = tis_api() else {
+        log::warn!("TIS: API unavailable");
+        return;
+    };
+    unsafe {
+        let current = (api.copy_current)();
+        if current.is_null() {
+            log::warn!("TIS: failed to get current input source");
+            return;
+        }
+        let current_id = input_source_id(api, current).unwrap_or_default();
+        CFRelease(current);
+
+        let want_korean = !current_id.contains("Korean");
+
+        if !want_korean {
+            // English direction: language lookup returns the keyboard layout
+            // (e.g. com.apple.keylayout.ABC), which is directly selectable.
+            let cf_lang = cfstring_from("en");
+            if cf_lang.is_null() {
+                log::warn!("TIS: CFStringCreateWithCString(en) failed");
+                return;
+            }
+            let target = (api.copy_for_language)(cf_lang);
+            CFRelease(cf_lang);
+            if target.is_null() {
+                log::warn!("TIS: no input source for language en");
+                return;
+            }
+            let target_id = input_source_id(api, target).unwrap_or_default();
+            let status = (api.select)(target);
+            CFRelease(target);
+            if status == 0 {
+                log::info!("TIS: switched to {target_id} (en)");
+            } else {
+                log::warn!("TIS: select {target_id} failed (OSStatus {status})");
+            }
+            return;
+        }
+
+        // Korean direction: walk the enabled input-source list and pick the
+        // first source whose ID contains "Korean" (this is the input mode,
+        // not the parent method).
+        let Some(create_list) = api.create_list else {
+            log::warn!("TIS: input-source list unavailable; cannot select Korean");
+            return;
+        };
+        let list = create_list(std::ptr::null(), false);
+        if list.is_null() {
+            log::warn!("TIS: failed to enumerate input sources");
+            return;
+        }
+        let count = CFArrayGetCount(list);
+        let mut selected = false;
+        for i in 0..count {
+            let source = CFArrayGetValueAtIndex(list, i) as TISInputSourceRef;
+            let id = match input_source_id(api, source) {
+                Some(s) => s,
+                None => continue,
+            };
+            // Korean input modes have an extra dotted suffix
+            // (e.g. com.apple.inputmethod.Korean.2SetKorean). The bare
+            // bundle id is not selectable.
+            if id.contains("Korean") && id.matches('.').count() > 3 {
+                let status = (api.select)(source);
+                if status == 0 {
+                    log::info!("TIS: switched to {id}");
+                    selected = true;
+                    break;
+                } else {
+                    log::warn!("TIS: select {id} failed (OSStatus {status})");
+                }
+            }
+        }
+        CFRelease(list);
+        if !selected {
+            log::warn!("TIS: no selectable Korean input mode found");
+        }
+    }
 }
 
 fn key_event(event_source: CGEventSource, key: u16, state: u8, modifiers: XMods) {
@@ -452,13 +693,28 @@ impl Emulation for MacOSEmulation {
                     key,
                     state,
                 } => {
+                    // Korean IME remap: Right Alt is commonly repurposed as the
+                    // Hangul/English toggle on Windows keyboards used with macOS.
+                    // Synthetic input-source shortcuts are rejected by macOS, so
+                    // toggle the input source via the Text Input Source API on
+                    // press. Right Alt's normal modifier handling is also skipped
+                    // so we don't emit an Option modifier event.
+                    let remap_to_ime_toggle = key == 100;
+                    if remap_to_ime_toggle {
+                        log::debug!("Right Alt -> Korean IME toggle (state={state})");
+                        if state == 1 {
+                            toggle_korean_input_source();
+                        }
+                        return Ok(());
+                    }
                     let code = match KeyMap::from_key_mapping(KeyMapping::Evdev(key as u16)) {
                         Ok(k) => k.mac as CGKeyCode,
                         Err(_) => {
-                            log::warn!("unable to map key event");
+                            log::warn!("unable to map key event for evdev key {key}");
                             return Ok(());
                         }
                     };
+                    log::trace!("key event: evdev={key} -> macos={code} (state={state})");
                     let is_modifier = update_modifiers(&self.modifier_state, key, state);
                     if is_modifier {
                         modifier_event(self.event_source.clone(), self.modifier_state.get());
