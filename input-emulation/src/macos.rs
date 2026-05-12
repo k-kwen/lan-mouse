@@ -29,6 +29,13 @@ const DEFAULT_REPEAT_DELAY: Duration = Duration::from_millis(500);
 const DEFAULT_REPEAT_INTERVAL: Duration = Duration::from_millis(32);
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Per-axis scale applied to incoming pointer motion deltas before they
+/// are turned into mouse-move events. macOS's `mouse.scaling` preference
+/// only affects HID devices, not synthetic CGEvents posted by lan-mouse,
+/// so the only reliable way to slow down the remote cursor is to scale
+/// the deltas here. 1.0 = original speed.
+const MOUSE_SPEED_MULTIPLIER: f64 = 0.7;
+
 pub(crate) struct MacOSEmulation {
     /// global event source for all events
     event_source: CGEventSource,
@@ -506,6 +513,8 @@ impl Emulation for MacOSEmulation {
             Event::Pointer(pointer_event) => {
                 match pointer_event {
                     PointerEvent::Motion { time: _, dx, dy } => {
+                        let dx = dx * MOUSE_SPEED_MULTIPLIER;
+                        let dy = dy * MOUSE_SPEED_MULTIPLIER;
                         let mut mouse_location = match self.get_mouse_location() {
                             Some(l) => l,
                             None => {
