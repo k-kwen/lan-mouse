@@ -274,6 +274,7 @@ impl Service {
                 pos: c.pos,
                 active: s.active,
                 enter_hook: c.cmd,
+                leave_hook: c.cmd_leave,
             })
             .collect();
         self.config.set_clients(clients);
@@ -398,7 +399,10 @@ impl Service {
             }
             ICaptureEvent::ClientEntered(handle) => {
                 log::info!("entering client {handle} ...");
-                self.spawn_hook_command(handle);
+                self.spawn_hook_command(handle, HookKind::Enter);
+            }
+            ICaptureEvent::ClientLeft(handle) => {
+                self.spawn_hook_command(handle, HookKind::Leave);
             }
         }
     }
@@ -635,29 +639,51 @@ impl Service {
         self.notify_frontend(event);
     }
 
-    fn spawn_hook_command(&self, handle: ClientHandle) {
-        let Some(cmd) = self.client_manager.get_enter_cmd(handle) else {
-            return;
+    fn spawn_hook_command(&self, handle: ClientHandle, kind: HookKind) {
+        let cmd = match kind {
+            HookKind::Enter => self.client_manager.get_enter_cmd(handle),
+            HookKind::Leave => self.client_manager.get_leave_cmd(handle),
         };
+        let Some(cmd) = cmd else { return };
+        let label = kind.label();
         tokio::task::spawn_local(async move {
-            log::info!("spawning command!");
-            let mut child = match Command::new("sh").arg("-c").arg(cmd.as_str()).spawn() {
+            log::info!("spawning {label} hook: {cmd}");
+            #[cfg(windows)]
+            let spawn_res = Command::new("cmd").arg("/C").arg(cmd.as_str()).spawn();
+            #[cfg(not(windows))]
+            let spawn_res = Command::new("sh").arg("-c").arg(cmd.as_str()).spawn();
+            let mut child = match spawn_res {
                 Ok(c) => c,
                 Err(e) => {
-                    log::warn!("could not execute cmd: {e}");
+                    log::warn!("could not execute {label} hook `{cmd}`: {e}");
                     return;
                 }
             };
             match child.wait().await {
                 Ok(s) => {
                     if s.success() {
-                        log::info!("{cmd} exited successfully");
+                        log::info!("{label} hook `{cmd}` exited successfully");
                     } else {
-                        log::warn!("{cmd} exited with {s}");
+                        log::warn!("{label} hook `{cmd}` exited with {s}");
                     }
                 }
-                Err(e) => log::warn!("{cmd}: {e}"),
+                Err(e) => log::warn!("{label} hook `{cmd}`: {e}"),
             }
         });
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum HookKind {
+    Enter,
+    Leave,
+}
+
+impl HookKind {
+    fn label(self) -> &'static str {
+        match self {
+            HookKind::Enter => "enter",
+            HookKind::Leave => "leave",
+        }
     }
 }

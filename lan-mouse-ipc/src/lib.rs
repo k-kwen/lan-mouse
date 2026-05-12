@@ -140,6 +140,8 @@ pub struct ClientConfig {
     pub pos: Position,
     /// enter hook
     pub cmd: Option<String>,
+    /// leave hook (fires when local cursor reclaims input from this remote client)
+    pub cmd_leave: Option<String>,
 }
 
 impl Default for ClientConfig {
@@ -150,6 +152,7 @@ impl Default for ClientConfig {
             fix_ips: Default::default(),
             pos: Default::default(),
             cmd: None,
+            cmd_leave: None,
         }
     }
 }

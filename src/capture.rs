@@ -37,6 +37,11 @@ pub(crate) enum ICaptureEvent {
     /// either the remote client leaving its device region,
     /// a new device entering the screen or the release bind.
     ClientEntered(u64),
+    /// The local cursor reclaimed input from a remote client
+    /// (peer sent a `Leave` — either they released their own
+    /// outbound capture or are taking over). Mirror of
+    /// [`ICaptureEvent::ClientEntered`] for the leave side.
+    ClientLeft(u64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -321,6 +326,9 @@ impl CaptureTask {
                         ProtoEvent::Leave(_) => {
                             log::info!("releasing capture: left remote client device region");
                             self.release_capture_handover(capture).await?;
+                            self.event_tx
+                                .send(ICaptureEvent::ClientLeft(handle))
+                                .expect("channel closed");
                         },
                         // Peer reported its display geometry — cache it
                         // so the wall-press model has a real upper
