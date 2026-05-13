@@ -43,6 +43,10 @@ pub(crate) struct MacOSEmulation {
     repeat_task: Option<JoinHandle<()>>,
     /// current state of the mouse buttons (tracked by evdev button code)
     pressed_buttons: HashSet<u32>,
+    /// extra buttons whose press was routed to a synthetic key (F9/F11).
+    /// The matching release must be swallowed so the host app never sees
+    /// a phantom mouseUp.
+    synth_keyed_buttons: HashSet<u32>,
     /// button previously pressed (evdev button code)
     previous_button: Option<u32>,
     /// timestamp of previous click (button down)
@@ -76,6 +80,7 @@ impl MacOSEmulation {
         Ok(Self {
             event_source,
             pressed_buttons: HashSet::new(),
+            synth_keyed_buttons: HashSet::new(),
             previous_button: None,
             previous_button_click: None,
             button_click_state: 0,
@@ -286,6 +291,386 @@ unsafe extern "C" {
     ) -> CFStringRef;
     fn CFArrayGetCount(arr: CFArrayRef) -> CFIndex;
     fn CFArrayGetValueAtIndex(arr: CFArrayRef, idx: CFIndex) -> *const c_void;
+    fn CFDictionaryGetValue(dict: *const c_void, key: *const c_void) -> *const c_void;
+    fn CFNumberGetValue(num: *const c_void, the_type: i64, value_ptr: *mut c_void) -> bool;
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGWindowListCopyWindowInfo(option: u32, relative_to: u32) -> CFArrayRef;
+    static kCGWindowOwnerName: CFStringRef;
+    static kCGWindowLayer: CFStringRef;
+}
+
+const K_CF_NUMBER_SINT32_TYPE: i64 = 3;
+const K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY: u32 = 1;
+const K_CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS: u32 = 1 << 4;
+
+/// Returns the owner-name of the topmost on-screen regular-app window
+/// (layer == 0). Used to route mouse4/mouse5 differently depending on
+/// the frontmost app (browsers/Finder keep back-forward semantics).
+fn frontmost_window_owner_name() -> Option<String> {
+    unsafe {
+        let arr = CGWindowListCopyWindowInfo(
+            K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY | K_CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS,
+            0,
+        );
+        if arr.is_null() {
+            return None;
+        }
+        let mut result: Option<String> = None;
+        let count = CFArrayGetCount(arr);
+        for i in 0..count {
+            let dict = CFArrayGetValueAtIndex(arr, i);
+            if dict.is_null() {
+                continue;
+            }
+            let layer_val = CFDictionaryGetValue(dict, kCGWindowLayer as *const c_void);
+            if layer_val.is_null() {
+                continue;
+            }
+            let mut layer: i32 = 0;
+            if !CFNumberGetValue(
+                layer_val,
+                K_CF_NUMBER_SINT32_TYPE,
+                &mut layer as *mut i32 as *mut c_void,
+            ) {
+                continue;
+            }
+            if layer != 0 {
+                continue;
+            }
+            let name_val = CFDictionaryGetValue(dict, kCGWindowOwnerName as *const c_void);
+            if name_val.is_null() {
+                continue;
+            }
+            let mut buf = [0u8; 256];
+            if !CFStringGetCString(
+                name_val as CFStringRef,
+                buf.as_mut_ptr(),
+                buf.len() as CFIndex,
+                K_CF_STRING_ENCODING_UTF8,
+            ) {
+                continue;
+            }
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            result = std::str::from_utf8(&buf[..end]).ok().map(|s| s.to_string());
+            break;
+        }
+        CFRelease(arr);
+        result
+    }
+}
+
+/// How a mouse4/mouse5 press should be routed based on the frontmost app.
+enum BackForwardRoute {
+    /// Forward the press as a standard OtherMouse button 3/4 event — the app
+    /// handles it natively (browsers).
+    Passthrough,
+    /// Synthesize ⌘+[ / ⌘+] — the app exposes navigation only via that menu
+    /// shortcut, not via raw side-buttons (Finder).
+    CmdBracket,
+    /// Trigger Mission Control / Show Desktop via a trusted path
+    /// (`open -a` / AppleScript System Events).
+    SystemShortcut,
+}
+
+fn back_forward_route(name: Option<&str>) -> BackForwardRoute {
+    match name {
+        Some("Google Chrome" | "Safari") => BackForwardRoute::Passthrough,
+        Some("Finder") => BackForwardRoute::CmdBracket,
+        _ => BackForwardRoute::SystemShortcut,
+    }
+}
+
+/// Synthesizes a ⌘+<key> chord. Used for Finder back/forward (⌘+[ and ⌘+]).
+/// App menu shortcuts are accepted from synthetic CGEvents (only *system*
+/// shortcut triggers like F9/F11 get rejected).
+///
+/// Wraps the chord with explicit FlagsChanged events so the system sees a
+/// clean ⌘-press / ⌘-release boundary — without the final release event,
+/// macOS leaves the modifier stuck, and the next left click is interpreted
+/// as ⌘+Click (no window focus, action happens in place, looks like a
+/// drag-without-focus bug).
+fn send_cmd_key(event_source: CGEventSource, mac_keycode: u16, current_mods: XMods) {
+    let mods_with_cmd = to_cgevent_flags(current_mods) | CGEventFlags::CGEventFlagCommand;
+    let mods_restored = to_cgevent_flags(current_mods);
+
+    // 1. Tell the system ⌘ is now down.
+    if let Ok(e) = CGEvent::new(event_source.clone()) {
+        e.set_type(CGEventType::FlagsChanged);
+        e.set_flags(mods_with_cmd);
+        e.post(CGEventTapLocation::HID);
+    }
+    // 2. Key down.
+    if let Ok(e) = CGEvent::new_keyboard_event(event_source.clone(), mac_keycode, true) {
+        e.set_flags(mods_with_cmd);
+        e.post(CGEventTapLocation::HID);
+    } else {
+        log::warn!("send_cmd_key: keydown creation failed");
+    }
+    // 3. Key up.
+    if let Ok(e) = CGEvent::new_keyboard_event(event_source.clone(), mac_keycode, false) {
+        e.set_flags(mods_with_cmd);
+        e.post(CGEventTapLocation::HID);
+    } else {
+        log::warn!("send_cmd_key: keyup creation failed");
+    }
+    // 4. Release ⌘ — restore the modifier state lan-mouse was tracking.
+    if let Ok(e) = CGEvent::new(event_source) {
+        e.set_type(CGEventType::FlagsChanged);
+        e.set_flags(mods_restored);
+        e.post(CGEventTapLocation::HID);
+    }
+}
+
+/// Triggers Mission Control by posting F9 from a `HIDSystemState` event
+/// source — the same low-level path Show Desktop uses (see
+/// `trigger_show_desktop`). HID-state events participate in WindowServer's
+/// mid-transition reverse handler, so a second click cancels an in-flight
+/// transition instead of waiting for the animation to finish.
+fn trigger_mission_control() {
+    let source = match CGEventSource::new(CGEventSourceStateID::HIDSystemState) {
+        Ok(s) => s,
+        Err(_) => {
+            log::warn!("trigger_mission_control: HID source creation failed");
+            return;
+        }
+    };
+    const KEY_F9: u16 = 0x65;
+    if let Ok(e) = CGEvent::new_keyboard_event(source.clone(), KEY_F9, true) {
+        e.post(CGEventTapLocation::HID);
+    } else {
+        log::warn!("trigger_mission_control: keydown creation failed");
+        return;
+    }
+    if let Ok(e) = CGEvent::new_keyboard_event(source, KEY_F9, false) {
+        e.post(CGEventTapLocation::HID);
+    } else {
+        log::warn!("trigger_mission_control: keyup creation failed");
+    }
+}
+
+/// Toggles the Korean IME by synthesizing a CapsLock press from a
+/// `HIDSystemState` source. Currently inactive — see analysis below: macOS
+/// treats CapsLock as a modifier *flag*, not a key, so a plain keyDown/keyUp
+/// CGEvent doesn't change the lock state even at HID-state priority. Kept
+/// for future experimentation (e.g. paired with a `FlagsChanged`
+/// `CGEventFlagAlphaShift` event).
+#[allow(dead_code)]
+fn toggle_korean_via_capslock() {
+    let source = match CGEventSource::new(CGEventSourceStateID::HIDSystemState) {
+        Ok(s) => s,
+        Err(_) => {
+            log::warn!("toggle_korean_via_capslock: HID source creation failed");
+            return;
+        }
+    };
+    const KEY_CAPSLOCK: u16 = 0x39;
+    if let Ok(e) = CGEvent::new_keyboard_event(source.clone(), KEY_CAPSLOCK, true) {
+        e.post(CGEventTapLocation::HID);
+    } else {
+        log::warn!("toggle_korean_via_capslock: keydown creation failed");
+        return;
+    }
+    if let Ok(e) = CGEvent::new_keyboard_event(source, KEY_CAPSLOCK, false) {
+        e.post(CGEventTapLocation::HID);
+    } else {
+        log::warn!("toggle_korean_via_capslock: keyup creation failed");
+    }
+}
+
+/// Triggers Show Desktop by posting F11 from a `HIDSystemState` CGEventSource,
+/// the event-source state that sits closest to a real HID interrupt. The hope
+/// is that WindowServer's mid-transition reverse handler (which lets native
+/// F11 cancel an in-flight Show Desktop transition) accepts this source. The
+/// AppleScript path we used before is trusted, but its events arrive too high
+/// in the stack to participate in transition-reverse, so the user only gets
+/// the second toggle *after* the first transition finishes.
+///
+/// If the HID-state path turns out to be rejected by the shortcut handler,
+/// swap back to `trigger_show_desktop_via_applescript()` below.
+fn trigger_show_desktop() {
+    let source = match CGEventSource::new(CGEventSourceStateID::HIDSystemState) {
+        Ok(s) => s,
+        Err(_) => {
+            log::warn!("trigger_show_desktop: HID source creation failed");
+            return;
+        }
+    };
+    const KEY_F11: u16 = 0x67;
+    if let Ok(e) = CGEvent::new_keyboard_event(source.clone(), KEY_F11, true) {
+        e.post(CGEventTapLocation::HID);
+    } else {
+        log::warn!("trigger_show_desktop: keydown creation failed");
+        return;
+    }
+    if let Ok(e) = CGEvent::new_keyboard_event(source, KEY_F11, false) {
+        e.post(CGEventTapLocation::HID);
+    } else {
+        log::warn!("trigger_show_desktop: keyup creation failed");
+    }
+}
+
+/// Legacy trigger kept around in case the HID-state path turns out to be
+/// rejected by the system shortcut handler. Routes through NSAppleScript /
+/// osascript (trusted, but high in the stack — no transition-reverse).
+#[allow(dead_code)]
+fn trigger_show_desktop_via_applescript() {
+    std::thread::spawn(|| {
+        const SCRIPT: &str = "tell application \"System Events\" to key code 103";
+        if run_apple_script_in_process(SCRIPT) {
+            return;
+        }
+        log::debug!("trigger_show_desktop: falling back to osascript subprocess");
+        let result = std::process::Command::new("/usr/bin/osascript")
+            .args(["-e", SCRIPT])
+            .status();
+        if let Err(e) = result {
+            log::warn!("trigger_show_desktop: subprocess spawn failed: {e}");
+        }
+    });
+}
+
+// ---- NSAppleScript in-process via Objective-C runtime + dlsym -------------
+//
+// Spawning `osascript` costs 200-300ms (process fork + Apple Event runtime
+// initialization). We can drop that to <10ms by going through Foundation's
+// NSAppleScript class directly. Symbols are resolved at runtime (matching
+// the same dlsym pattern used for the TIS Korean-IME toggle) so we add no
+// new build dependencies. The first call still pays the AppleScript runtime
+// warmup, but subsequent calls are fast.
+
+type ObjcId = *const c_void;
+type ObjcSel = *const c_void;
+type ObjcClass = *const c_void;
+
+type FnObjcGetClass = unsafe extern "C" fn(name: *const std::ffi::c_char) -> ObjcClass;
+type FnSelRegisterName = unsafe extern "C" fn(name: *const std::ffi::c_char) -> ObjcSel;
+type FnMsgSend0 = unsafe extern "C" fn(ObjcId, ObjcSel) -> ObjcId;
+type FnMsgSend1 = unsafe extern "C" fn(ObjcId, ObjcSel, ObjcId) -> ObjcId;
+type FnMsgSendErr = unsafe extern "C" fn(ObjcId, ObjcSel, *mut ObjcId) -> ObjcId;
+
+struct AppleScriptApi {
+    nsapplescript_class: ObjcClass,
+    nsautoreleasepool_class: ObjcClass,
+    alloc_sel: ObjcSel,
+    init_sel: ObjcSel,
+    init_with_source_sel: ObjcSel,
+    execute_sel: ObjcSel,
+    release_sel: ObjcSel,
+    drain_sel: ObjcSel,
+    msg_send_0: FnMsgSend0,
+    msg_send_1: FnMsgSend1,
+    msg_send_err: FnMsgSendErr,
+}
+
+unsafe impl Send for AppleScriptApi {}
+unsafe impl Sync for AppleScriptApi {}
+
+static APPLESCRIPT_API: std::sync::OnceLock<Option<AppleScriptApi>> =
+    std::sync::OnceLock::new();
+
+fn applescript_api() -> Option<&'static AppleScriptApi> {
+    APPLESCRIPT_API
+        .get_or_init(|| unsafe {
+            // Pull in Foundation so NSAppleScript is in dyld. Failure is
+            // tolerated — Foundation is usually loaded transitively.
+            let foundation_path =
+                c"/System/Library/Frameworks/Foundation.framework/Foundation";
+            let _foundation = dlopen(foundation_path.as_ptr(), RTLD_LAZY);
+
+            let get_class = dlsym(RTLD_DEFAULT, c"objc_getClass".as_ptr());
+            let sel_register = dlsym(RTLD_DEFAULT, c"sel_registerName".as_ptr());
+            let msg_send = dlsym(RTLD_DEFAULT, c"objc_msgSend".as_ptr());
+            if get_class.is_null() || sel_register.is_null() || msg_send.is_null() {
+                log::warn!("NSAppleScript: objc runtime missing; subprocess fallback only");
+                return None;
+            }
+            let get_class: FnObjcGetClass = std::mem::transmute(get_class);
+            let sel_register: FnSelRegisterName = std::mem::transmute(sel_register);
+            let msg_send_0: FnMsgSend0 = std::mem::transmute(msg_send);
+            let msg_send_1: FnMsgSend1 = std::mem::transmute(msg_send);
+            let msg_send_err: FnMsgSendErr = std::mem::transmute(msg_send);
+
+            let nsapplescript_class = get_class(c"NSAppleScript".as_ptr());
+            let nsautoreleasepool_class = get_class(c"NSAutoreleasePool".as_ptr());
+            if nsapplescript_class.is_null() || nsautoreleasepool_class.is_null() {
+                log::warn!(
+                    "NSAppleScript: required classes not found; subprocess fallback only"
+                );
+                return None;
+            }
+            Some(AppleScriptApi {
+                nsapplescript_class,
+                nsautoreleasepool_class,
+                alloc_sel: sel_register(c"alloc".as_ptr()),
+                init_sel: sel_register(c"init".as_ptr()),
+                init_with_source_sel: sel_register(c"initWithSource:".as_ptr()),
+                execute_sel: sel_register(c"executeAndReturnError:".as_ptr()),
+                release_sel: sel_register(c"release".as_ptr()),
+                drain_sel: sel_register(c"drain".as_ptr()),
+                msg_send_0,
+                msg_send_1,
+                msg_send_err,
+            })
+        })
+        .as_ref()
+}
+
+/// Compiles and executes a one-shot AppleScript using NSAppleScript in this
+/// process. Returns `true` on success; `false` if the runtime was unavailable
+/// or the source couldn't be turned into an NSString. AppleScript runtime
+/// errors are logged but still return `true` (we did execute — the script
+/// itself failed).
+fn run_apple_script_in_process(source: &str) -> bool {
+    let Some(api) = applescript_api() else {
+        return false;
+    };
+    let ns_string = cfstring_from(source);
+    if ns_string.is_null() {
+        return false;
+    }
+    unsafe {
+        let pool_alloc = (api.msg_send_0)(api.nsautoreleasepool_class, api.alloc_sel);
+        let pool = if pool_alloc.is_null() {
+            std::ptr::null()
+        } else {
+            (api.msg_send_0)(pool_alloc, api.init_sel)
+        };
+
+        let script_alloc = (api.msg_send_0)(api.nsapplescript_class, api.alloc_sel);
+        if script_alloc.is_null() {
+            if !pool.is_null() {
+                let _ = (api.msg_send_0)(pool, api.drain_sel);
+            }
+            CFRelease(ns_string);
+            return false;
+        }
+        let script =
+            (api.msg_send_1)(script_alloc, api.init_with_source_sel, ns_string as ObjcId);
+        if script.is_null() {
+            if !pool.is_null() {
+                let _ = (api.msg_send_0)(pool, api.drain_sel);
+            }
+            CFRelease(ns_string);
+            log::warn!("NSAppleScript: initWithSource: returned nil");
+            return false;
+        }
+        let mut err: ObjcId = std::ptr::null();
+        let _result = (api.msg_send_err)(script, api.execute_sel, &mut err);
+        let _ = (api.msg_send_0)(script, api.release_sel);
+
+        if !err.is_null() {
+            log::warn!("NSAppleScript: execution returned an error dictionary");
+        }
+
+        if !pool.is_null() {
+            let _ = (api.msg_send_0)(pool, api.drain_sel);
+        }
+        CFRelease(ns_string);
+    }
+    true
 }
 
 fn cfstring_from(s: &str) -> CFStringRef {
@@ -558,6 +943,62 @@ impl Emulation for MacOSEmulation {
                         button,
                         state,
                     } => {
+                        // Route mouse4 (BTN_BACK) / mouse5 (BTN_FORWARD) to
+                        // F9 (Mission Control) / F11 (Show Desktop) unless the
+                        // frontmost app is a browser/Finder, where back-forward
+                        // is the natural behavior.
+                        if matches!(button, BTN_BACK | BTN_FORWARD) {
+                            if state == 1 {
+                                let owner = frontmost_window_owner_name();
+                                match back_forward_route(owner.as_deref()) {
+                                    BackForwardRoute::Passthrough => {
+                                        // fall through to existing OtherMouseDown logic
+                                    }
+                                    BackForwardRoute::CmdBracket => {
+                                        let bracket_key: u16 = if button == BTN_BACK {
+                                            0x21 // "["
+                                        } else {
+                                            0x1E // "]"
+                                        };
+                                        log::debug!(
+                                            "mouse{} -> ⌘+{} (frontmost: {:?})",
+                                            if button == BTN_BACK { 4 } else { 5 },
+                                            if button == BTN_BACK { "[" } else { "]" },
+                                            owner
+                                        );
+                                        send_cmd_key(
+                                            self.event_source.clone(),
+                                            bracket_key,
+                                            self.modifier_state.get(),
+                                        );
+                                        self.synth_keyed_buttons.insert(button);
+                                        return Ok(());
+                                    }
+                                    BackForwardRoute::SystemShortcut => {
+                                        log::debug!(
+                                            "mouse{} -> {} (frontmost: {:?})",
+                                            if button == BTN_BACK { 4 } else { 5 },
+                                            if button == BTN_BACK {
+                                                "Mission Control"
+                                            } else {
+                                                "Show Desktop"
+                                            },
+                                            owner
+                                        );
+                                        if button == BTN_BACK {
+                                            trigger_mission_control();
+                                        } else {
+                                            trigger_show_desktop();
+                                        }
+                                        self.synth_keyed_buttons.insert(button);
+                                        return Ok(());
+                                    }
+                                }
+                            } else if self.synth_keyed_buttons.remove(&button) {
+                                // matching release for a synth-routed press
+                                return Ok(());
+                            }
+                        }
                         // button number for OtherMouse events (3 = back, 4 = forward, etc.)
                         let cg_button_number: Option<i64> = match button {
                             BTN_BACK => Some(3),
@@ -715,6 +1156,30 @@ impl Emulation for MacOSEmulation {
                             toggle_korean_input_source();
                         }
                         return Ok(());
+                    }
+                    // System-shortcut function keys: macOS rejects CGEvent-
+                    // synthesized triggers for system shortcuts (the same
+                    // policy that makes synthetic F18/Ctrl+Space fail for
+                    // IME). Route F9 / F11 through the same trusted path
+                    // mouse4/mouse5 use.
+                    match key {
+                        67 => {
+                            // evdev KEY_F9 -> Mission Control
+                            if state == 1 {
+                                log::debug!("F9 -> Mission Control");
+                                trigger_mission_control();
+                            }
+                            return Ok(());
+                        }
+                        87 => {
+                            // evdev KEY_F11 -> Show Desktop
+                            if state == 1 {
+                                log::debug!("F11 -> Show Desktop");
+                                trigger_show_desktop();
+                            }
+                            return Ok(());
+                        }
+                        _ => {}
                     }
                     let code = match KeyMap::from_key_mapping(KeyMapping::Evdev(key as u16)) {
                         Ok(k) => k.mac as CGKeyCode,
