@@ -101,7 +101,18 @@ impl InputCaptureState {
                 || (position == Position::Top && (location.y + relative_y) <= self.bounds.ymin)
                 || (position == Position::Bottom && (location.y + relative_y) >= self.bounds.ymax)
             {
-                log::debug!("Crossed barrier into position: {position:?}");
+                // Human-error guard: require ⌘ to be held in order to cross
+                // the barrier. Without ⌘, return None — capture never starts,
+                // and macOS naturally clamps the cursor at the edge. With ⌘,
+                // the existing modifier-sync logic emits a Modifiers event on
+                // the first post-capture motion so the peer sees ⌘ pressed.
+                if !event.get_flags().contains(CGEventFlags::CGEventFlagCommand) {
+                    log::trace!(
+                        "Crossed barrier into {position:?} but ⌘ not held — guarded"
+                    );
+                    return None;
+                }
+                log::debug!("Crossed barrier into position: {position:?} (⌘ held)");
                 return Some(position);
             }
         }
