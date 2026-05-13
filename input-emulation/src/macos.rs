@@ -618,6 +618,181 @@ fn applescript_api() -> Option<&'static AppleScriptApi> {
         .as_ref()
 }
 
+// ---- NSEvent media-key synthesis via Objective-C runtime + dlsym ----------
+//
+// macOS routes hardware volume / mute / brightness / play-pause keys as
+// `NSSystemDefined` events (type 14, subtype 8 — "auxiliary control
+// buttons"), NOT as regular keyboard events. Posting CGKeyDown/KeyUp at the
+// matching keycode (kVK_VolumeUp etc.) does NOT change volume or pop the
+// OSD — the system shortcut handler ignores it.
+//
+// The well-known synthesis path is `+[NSEvent
+// otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:
+// subtype:data1:data2:]` followed by `-CGEvent` and CGEventPost. We reach
+// that via objc_msgSend resolved at runtime (same pattern as NSAppleScript
+// above), avoiding a new build dependency.
+
+const NSEVENT_TYPE_SYSTEM_DEFINED: u64 = 14;
+const NSEVENT_SUBTYPE_AUX_CONTROL: i64 = 8;
+const NX_KEYTYPE_SOUND_UP: u32 = 0;
+const NX_KEYTYPE_SOUND_DOWN: u32 = 1;
+const NX_KEYTYPE_MUTE: u32 = 7;
+const K_CG_HID_EVENT_TAP: u32 = 0;
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct NSPoint {
+    x: f64,
+    y: f64,
+}
+
+type FnNSEventOther = unsafe extern "C" fn(
+    cls: ObjcClass,
+    sel: ObjcSel,
+    event_type: u64,
+    location: NSPoint,
+    modifier_flags: u64,
+    timestamp: f64,
+    window_number: i64,
+    context: ObjcId,
+    subtype: i16,
+    data1: i64,
+    data2: i64,
+) -> ObjcId;
+
+type FnNSEventCGEvent = unsafe extern "C" fn(self_: ObjcId, sel: ObjcSel) -> *const c_void;
+
+#[link(name = "ApplicationServices", kind = "framework")]
+unsafe extern "C" {
+    fn CGEventPost(tap: u32, event: *const c_void);
+}
+
+struct MediaKeyApi {
+    nsevent_class: ObjcClass,
+    other_event_sel: ObjcSel,
+    cg_event_sel: ObjcSel,
+    other_event: FnNSEventOther,
+    cg_event_of: FnNSEventCGEvent,
+}
+
+unsafe impl Send for MediaKeyApi {}
+unsafe impl Sync for MediaKeyApi {}
+
+static MEDIA_KEY_API: std::sync::OnceLock<Option<MediaKeyApi>> = std::sync::OnceLock::new();
+
+fn media_key_api() -> Option<&'static MediaKeyApi> {
+    MEDIA_KEY_API
+        .get_or_init(|| unsafe {
+            // Need AppKit loaded for NSEvent.
+            let _appkit =
+                dlopen(c"/System/Library/Frameworks/AppKit.framework/AppKit".as_ptr(), RTLD_LAZY);
+            let get_class = dlsym(RTLD_DEFAULT, c"objc_getClass".as_ptr());
+            let sel_register = dlsym(RTLD_DEFAULT, c"sel_registerName".as_ptr());
+            let msg_send = dlsym(RTLD_DEFAULT, c"objc_msgSend".as_ptr());
+            if get_class.is_null() || sel_register.is_null() || msg_send.is_null() {
+                log::warn!("media-key: objc runtime missing");
+                return None;
+            }
+            let get_class: FnObjcGetClass = std::mem::transmute(get_class);
+            let sel_register: FnSelRegisterName = std::mem::transmute(sel_register);
+            let other_event: FnNSEventOther = std::mem::transmute(msg_send);
+            let cg_event_of: FnNSEventCGEvent = std::mem::transmute(msg_send);
+
+            let nsevent_class = get_class(c"NSEvent".as_ptr());
+            if nsevent_class.is_null() {
+                log::warn!("media-key: NSEvent class not found");
+                return None;
+            }
+            let other_event_sel = sel_register(
+                c"otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:subtype:data1:data2:".as_ptr(),
+            );
+            let cg_event_sel = sel_register(c"CGEvent".as_ptr());
+            Some(MediaKeyApi {
+                nsevent_class,
+                other_event_sel,
+                cg_event_sel,
+                other_event,
+                cg_event_of,
+            })
+        })
+        .as_ref()
+}
+
+/// Synthesizes a media key press (keydown + keyup) via NSSystemDefined event.
+/// `key_type` is one of NX_KEYTYPE_SOUND_UP / SOUND_DOWN / MUTE / PLAY etc.
+/// This produces the system OSD that real hardware volume keys produce.
+///
+/// `fine_step` adds Shift+Option NSEvent modifier bits — equivalent to a
+/// physical Shift+Option+VolumeKey on a Mac keyboard, which macOS interprets
+/// as a 1/4-step (so the volume changes in 1/64 increments instead of 1/16).
+/// `false` matches a plain hardware volume-key press.
+fn post_media_key(key_type: u32, fine_step: bool) {
+    // NSEventModifierFlag bits — only the higher-order ones are NSEvent
+    // modifier flags; the lower 0xa00/0xb00 bits are the media-key magic.
+    const NSEVENT_MOD_SHIFT: u64 = 1 << 17;
+    const NSEVENT_MOD_OPTION: u64 = 1 << 19;
+    let fine_mods: u64 = if fine_step {
+        NSEVENT_MOD_SHIFT | NSEVENT_MOD_OPTION
+    } else {
+        0
+    };
+
+    let Some(media) = media_key_api() else {
+        log::warn!("post_media_key: API unavailable");
+        return;
+    };
+    // Borrow the NSAppleScript-side autorelease pool helpers so the events
+    // we synthesize get released instead of accumulating per call.
+    let pool_api = applescript_api();
+    unsafe {
+        let pool = pool_api.map(|p| {
+            let alloc = (p.msg_send_0)(p.nsautoreleasepool_class, p.alloc_sel);
+            if alloc.is_null() {
+                std::ptr::null()
+            } else {
+                (p.msg_send_0)(alloc, p.init_sel)
+            }
+        });
+
+        for &down in &[true, false] {
+            let flags: u64 = (if down { 0xa00 } else { 0xb00 }) | fine_mods;
+            // data1 encodes (keyType in upper 16 bits) | (down/up flag in lower 16).
+            let state_nibble: i64 = if down { 0xa } else { 0xb };
+            let data1: i64 = ((key_type as i64) << 16) | (state_nibble << 8);
+
+            let nsevent = (media.other_event)(
+                media.nsevent_class,
+                media.other_event_sel,
+                NSEVENT_TYPE_SYSTEM_DEFINED,
+                NSPoint { x: 0.0, y: 0.0 },
+                flags,
+                0.0,
+                0,
+                std::ptr::null(),
+                NSEVENT_SUBTYPE_AUX_CONTROL as i16,
+                data1,
+                -1,
+            );
+            if nsevent.is_null() {
+                log::warn!("post_media_key: NSEvent creation returned nil");
+                continue;
+            }
+            let cg_event = (media.cg_event_of)(nsevent, media.cg_event_sel);
+            if cg_event.is_null() {
+                log::warn!("post_media_key: -[NSEvent CGEvent] returned NULL");
+                continue;
+            }
+            CGEventPost(K_CG_HID_EVENT_TAP, cg_event);
+        }
+
+        if let (Some(p), Some(pool_obj)) = (pool_api, pool) {
+            if !pool_obj.is_null() {
+                let _ = (p.msg_send_0)(pool_obj, p.drain_sel);
+            }
+        }
+    }
+}
+
 /// Compiles and executes a one-shot AppleScript using NSAppleScript in this
 /// process. Returns `true` on success; `false` if the runtime was unavailable
 /// or the source couldn't be turned into an NSString. AppleScript runtime
@@ -1176,6 +1351,33 @@ impl Emulation for MacOSEmulation {
                             if state == 1 {
                                 log::debug!("F11 -> Show Desktop");
                                 trigger_show_desktop();
+                            }
+                            return Ok(());
+                        }
+                        // Media keys: macOS expects these as NSSystemDefined
+                        // events, not regular keyboard events. A KeyDown at
+                        // kVK_VolumeUp etc. would do nothing.
+                        113 => {
+                            // evdev KEY_MUTE — single state, no fine grain
+                            if state == 1 {
+                                log::debug!("Mute key -> NSSystemDefined MUTE");
+                                post_media_key(NX_KEYTYPE_MUTE, false);
+                            }
+                            return Ok(());
+                        }
+                        114 => {
+                            // evdev KEY_VOLUMEDOWN — fine step (¼ of native step)
+                            if state == 1 {
+                                log::debug!("VolumeDown -> NSSystemDefined SOUND_DOWN (fine)");
+                                post_media_key(NX_KEYTYPE_SOUND_DOWN, true);
+                            }
+                            return Ok(());
+                        }
+                        115 => {
+                            // evdev KEY_VOLUMEUP — fine step (¼ of native step)
+                            if state == 1 {
+                                log::debug!("VolumeUp -> NSSystemDefined SOUND_UP (fine)");
+                                post_media_key(NX_KEYTYPE_SOUND_UP, true);
                             }
                             return Ok(());
                         }
