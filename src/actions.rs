@@ -1,9 +1,10 @@
+use clap::Args;
 use lan_mouse_ipc::ClientAction;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 #[allow(dead_code)]
-pub(crate) enum ActionError {
+pub enum ActionError {
     #[error("DDC/VCP actions are only supported on Windows")]
     Unsupported,
     #[error("blocking action task failed: {0}")]
@@ -21,6 +22,31 @@ pub(crate) async fn run(action: ClientAction) -> Result<(), ActionError> {
             ..
         } => tokio::task::spawn_blocking(move || platform::set_vcp(monitor, code, value)).await?,
     }
+}
+
+#[derive(Args, Clone, Debug, Eq, PartialEq)]
+pub struct TestDdcArgs {
+    /// monitor selector: index, display name, hardware ID, or description
+    #[arg(long)]
+    monitor: Option<String>,
+
+    /// VCP code; 0x60 is input source
+    #[arg(long, default_value_t = 0x60)]
+    code: u8,
+
+    /// VCP value to write
+    #[arg(long)]
+    value: u32,
+}
+
+pub async fn test_ddc(args: TestDdcArgs) -> Result<(), ActionError> {
+    run(ClientAction::DdcVcp {
+        on: lan_mouse_ipc::ActionTrigger::Enter,
+        monitor: args.monitor,
+        code: args.code,
+        value: args.value,
+    })
+    .await
 }
 
 #[cfg(windows)]

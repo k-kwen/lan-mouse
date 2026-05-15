@@ -3,6 +3,7 @@ mod logging;
 use input_capture::InputCaptureError;
 use input_emulation::InputEmulationError;
 use lan_mouse::{
+    actions::{self, ActionError},
     capture_test,
     config::{self, Command, Config, ConfigError},
     emulation_test,
@@ -40,6 +41,8 @@ enum LanMouseError {
     Cli(#[from] CliError),
     #[error(transparent)]
     Pairing(#[from] PairingError),
+    #[error(transparent)]
+    Action(#[from] ActionError),
 }
 
 fn main() {
@@ -59,6 +62,7 @@ fn run() -> Result<(), LanMouseError> {
         Some(command) => match command {
             Command::TestEmulation(args) => run_async(emulation_test::run(config, args))?,
             Command::TestCapture(args) => run_async(capture_test::run(config, args))?,
+            Command::TestDdc(args) => run_async(actions::test_ddc(args))?,
             Command::Discover(args) => run_async(pairing::discover_command(args))?,
             Command::Pair(args) => run_async(pairing::pair_command(config, args))?,
             Command::Cli(cli_args) => run_async(lan_mouse_cli::run(cli_args))?,

@@ -134,7 +134,8 @@ Each package milestone should run this loop:
 3. Package smoke: install from a clean temporary directory
 4. Runtime smoke: scheduled task starts, `cli list` shows one active Mac peer
 5. Discovery smoke: change/relearn Mac IP without editing `config.toml`
-6. Monitor smoke: enter and leave switch the monitor input exactly once
+6. Monitor smoke: `test-ddc --monitor PHLC277 --value 18` succeeds, then enter
+   and leave switch the monitor input exactly once
 
 ## Non-goals
 

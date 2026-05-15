@@ -147,6 +147,8 @@ pub enum Command {
     TestEmulation(TestEmulationArgs),
     /// test input capture
     TestCapture(TestCaptureArgs),
+    /// test a native DDC/VCP monitor command
+    TestDdc(crate::actions::TestDdcArgs),
     /// discover lan-mouse peers on the local network
     Discover(crate::pairing::DiscoverArgs),
     /// write a dynamic-IP-safe peer configuration

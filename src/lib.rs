@@ -1,4 +1,4 @@
-mod actions;
+pub mod actions;
 mod capture;
 pub mod capture_test;
 pub mod client;

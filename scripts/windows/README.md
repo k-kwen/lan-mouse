@@ -56,6 +56,12 @@ You can inspect visible peers before installing:
 .\lan-mouse.exe discover --json
 ```
 
+You can test native DDC without moving the cursor across screens:
+
+```powershell
+.\lan-mouse.exe test-ddc --monitor PHLC277 --value 18
+```
+
 ## Uninstall
 
 ```powershell
