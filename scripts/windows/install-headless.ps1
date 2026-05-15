@@ -13,6 +13,7 @@ param(
     [string] $PeerLabel = "mac",
     [string] $ControlMyMonitorPath = "",
     [string] $MonitorSelector = "",
+    [UInt32] $DdcCode = 0x60,
     [UInt32] $MacInput = 0,
     [UInt32] $WindowsInput = 0,
     [switch] $NoStart,
@@ -65,10 +66,12 @@ if ($PSCmdlet.ShouldProcess($InstallDir, "Install lan-mouse headless runtime")) 
 
     Copy-Item -LiteralPath $ExePath -Destination $ExeDest -Force
 
-    $UseMonitorHooks = -not [string]::IsNullOrWhiteSpace($ControlMyMonitorPath) -and
-        -not [string]::IsNullOrWhiteSpace($MonitorSelector) -and
+    $HasMonitorSwitch = -not [string]::IsNullOrWhiteSpace($MonitorSelector) -and
         $MacInput -ne 0 -and
         $WindowsInput -ne 0
+    $UseMonitorHooks = $HasMonitorSwitch -and
+        -not [string]::IsNullOrWhiteSpace($ControlMyMonitorPath)
+    $UseNativeDdc = $HasMonitorSwitch -and -not $UseMonitorHooks
 
     if ($UseMonitorHooks) {
         $ControlMyMonitorPath = Resolve-InstallPath $ControlMyMonitorPath
@@ -105,6 +108,12 @@ if ($PSCmdlet.ShouldProcess($InstallDir, "Install lan-mouse headless runtime")) 
     if ($UseMonitorHooks) {
         $PairArgs += @("--enter-hook", $EnterHook)
         $PairArgs += @("--leave-hook", $LeaveHook)
+    }
+    if ($UseNativeDdc) {
+        $PairArgs += @("--ddc-monitor", $MonitorSelector)
+        $PairArgs += @("--ddc-code", ([string] $DdcCode))
+        $PairArgs += @("--ddc-enter-input", ([string] $MacInput))
+        $PairArgs += @("--ddc-leave-input", ([string] $WindowsInput))
     }
 
     & $ExeDest @PairArgs

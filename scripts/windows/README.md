@@ -19,7 +19,22 @@ Set-ExecutionPolicy -Scope Process Bypass -Force
   -MacHostname "Kwen-PA-serverui-Macmini.local"
 ```
 
-For the current Philips monitor switching setup:
+For native Rust DDC monitor switching:
+
+```powershell
+.\install-headless.ps1 `
+  -PeerFingerprint "b9:2c:..." `
+  -Position left `
+  -MacHostname "Kwen-PA-serverui-Macmini.local" `
+  -MonitorSelector "PHLC277" `
+  -MacInput 17 `
+  -WindowsInput 18
+```
+
+`DdcCode` defaults to `0x60`, the VCP input-source code.
+
+If native DDC does not work for a particular monitor, pass
+`ControlMyMonitorPath` to keep the legacy hook fallback:
 
 ```powershell
 .\install-headless.ps1 `

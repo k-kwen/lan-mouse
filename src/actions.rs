@@ -26,19 +26,26 @@ pub(crate) async fn run(action: ClientAction) -> Result<(), ActionError> {
 #[cfg(windows)]
 mod platform {
     use super::ActionError;
-    use std::ptr::addr_of_mut;
+    use std::{mem, ptr::addr_of_mut};
     use windows::Win32::Devices::Display::{
         DestroyPhysicalMonitors, GetNumberOfPhysicalMonitorsFromHMONITOR,
         GetPhysicalMonitorsFromHMONITOR, PHYSICAL_MONITOR, SetVCPFeature,
     };
-    use windows::Win32::Foundation::{LPARAM, RECT};
-    use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, HDC, HMONITOR};
-    use windows::core::{BOOL, Error as WindowsError};
+    use windows::Win32::Foundation::{FALSE, LPARAM, RECT};
+    use windows::Win32::Graphics::Gdi::{
+        DISPLAY_DEVICEW, EnumDisplayDevicesW, EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR,
+        MONITORINFO, MONITORINFOEXW,
+    };
+    use windows::core::{BOOL, Error as WindowsError, PCWSTR};
 
     struct PhysicalMonitor {
         index: usize,
         raw: PHYSICAL_MONITOR,
         description: String,
+        display_name: String,
+        display_string: String,
+        monitor_id: String,
+        monitor_string: String,
     }
 
     pub(super) fn set_vcp(
@@ -50,7 +57,12 @@ mod platform {
         let Some(monitor) = select_monitor(&monitors, monitor_selector.as_deref()) else {
             let available = monitors
                 .iter()
-                .map(|m| format!("{}:{}", m.index, m.description))
+                .map(|m| {
+                    format!(
+                        "{}:{} display={} monitor_id={}",
+                        m.index, m.description, m.display_name, m.monitor_id
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             return Err(ActionError::Platform(format!(
@@ -89,8 +101,10 @@ mod platform {
         }
         let selector = selector.to_ascii_lowercase();
         monitors.iter().find(|monitor| {
-            monitor.description.to_ascii_lowercase().contains(&selector)
-                || selector.contains(&format!("monitor{}", monitor.index))
+            monitor
+                .selector_labels()
+                .iter()
+                .any(|label| label.contains(&selector))
         })
     }
 
@@ -123,6 +137,7 @@ mod platform {
 
         let mut out = Vec::new();
         for monitor in logical {
+            let display = display_metadata(monitor)?;
             let mut count = 0;
             unsafe {
                 GetNumberOfPhysicalMonitorsFromHMONITOR(monitor, &mut count)
@@ -143,6 +158,10 @@ mod platform {
                     index,
                     raw,
                     description,
+                    display_name: display.display_name.clone(),
+                    display_string: display.display_string.clone(),
+                    monitor_id: display.monitor_id.clone(),
+                    monitor_string: display.monitor_string.clone(),
                 });
             }
         }
@@ -154,13 +173,87 @@ mod platform {
         Ok(out)
     }
 
+    struct DisplayMetadata {
+        display_name: String,
+        display_string: String,
+        monitor_id: String,
+        monitor_string: String,
+    }
+
+    fn display_metadata(monitor: HMONITOR) -> Result<DisplayMetadata, ActionError> {
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = mem::size_of::<MONITORINFOEXW>() as u32;
+        let ok = unsafe {
+            GetMonitorInfoW(
+                monitor,
+                &mut info as *mut MONITORINFOEXW as *mut MONITORINFO,
+            )
+        };
+        if !ok.as_bool() {
+            return Err(ActionError::Platform(format!(
+                "GetMonitorInfoW failed: {}",
+                WindowsError::from_win32()
+            )));
+        }
+
+        let display_name = wide_to_string(&info.szDevice);
+        let mut display_device = DISPLAY_DEVICEW::default();
+        display_device.cb = mem::size_of::<DISPLAY_DEVICEW>() as u32;
+        let display_ok = unsafe {
+            EnumDisplayDevicesW(
+                PCWSTR::from_raw(info.szDevice.as_ptr()),
+                0,
+                &mut display_device,
+                0,
+            )
+        };
+
+        if display_ok == FALSE {
+            return Ok(DisplayMetadata {
+                display_name,
+                display_string: String::new(),
+                monitor_id: String::new(),
+                monitor_string: String::new(),
+            });
+        }
+
+        Ok(DisplayMetadata {
+            display_name,
+            display_string: wide_to_string(&display_device.DeviceString),
+            monitor_id: wide_to_string(&display_device.DeviceID),
+            monitor_string: wide_to_string(&display_device.DeviceName),
+        })
+    }
+
     fn monitor_description(monitor: &PHYSICAL_MONITOR) -> String {
         let description = monitor.szPhysicalMonitorDescription;
+        wide_to_string(&description)
+    }
+
+    fn wide_to_string(description: &[u16]) -> String {
         let len = description
             .iter()
             .position(|&c| c == 0)
             .unwrap_or(description.len());
         String::from_utf16_lossy(&description[..len])
+    }
+
+    impl PhysicalMonitor {
+        fn selector_labels(&self) -> Vec<String> {
+            [
+                self.index.to_string(),
+                format!("monitor{}", self.index),
+                self.description.clone(),
+                self.display_name.clone(),
+                self.display_string.clone(),
+                self.monitor_id.clone(),
+                self.monitor_string.clone(),
+            ]
+            .into_iter()
+            .filter(|label| !label.is_empty())
+            .map(|label| label.to_ascii_lowercase())
+            .collect()
+        }
     }
 
     impl Drop for PhysicalMonitor {

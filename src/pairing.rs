@@ -18,7 +18,7 @@ use crate::{
         strip_trailing_dot,
     },
 };
-use lan_mouse_ipc::{DEFAULT_PORT, Position};
+use lan_mouse_ipc::{ActionTrigger, ClientAction, DEFAULT_PORT, Position};
 
 #[derive(Args, Clone, Debug, Eq, PartialEq)]
 pub struct DiscoverArgs {
@@ -68,6 +68,22 @@ pub struct PairArgs {
     /// optional leave hook command
     #[arg(long)]
     leave_hook: Option<String>,
+
+    /// native DDC monitor selector for input-source switching
+    #[arg(long)]
+    ddc_monitor: Option<String>,
+
+    /// VCP code for native DDC switching; 0x60 is input source
+    #[arg(long, default_value_t = 0x60)]
+    ddc_code: u8,
+
+    /// DDC input-source value to apply when entering the peer screen
+    #[arg(long)]
+    ddc_enter_input: Option<u32>,
+
+    /// DDC input-source value to apply when leaving the peer screen
+    #[arg(long)]
+    ddc_leave_input: Option<u32>,
 }
 
 #[derive(Debug, Error)]
@@ -131,6 +147,12 @@ pub async fn pair_command(mut config: Config, args: PairArgs) -> Result<(), Pair
         .hostname
         .or_else(|| matched.map(|peer| peer.hostname.clone()));
     let port = matched.map(|peer| peer.port).unwrap_or(args.port);
+    let actions = ddc_actions(
+        args.ddc_monitor,
+        args.ddc_code,
+        args.ddc_enter_input,
+        args.ddc_leave_input,
+    );
     let mut clients = config.clients();
     let new_client = ConfigClient {
         ips: HashSet::new(),
@@ -141,7 +163,7 @@ pub async fn pair_command(mut config: Config, args: PairArgs) -> Result<(), Pair
         active: true,
         enter_hook: args.enter_hook,
         leave_hook: args.leave_hook,
-        actions: vec![],
+        actions,
     };
 
     if let Some(existing) = clients.iter_mut().find(|client| {
@@ -180,6 +202,35 @@ pub async fn pair_command(mut config: Config, args: PairArgs) -> Result<(), Pair
         );
     }
     Ok(())
+}
+
+fn ddc_actions(
+    monitor: Option<String>,
+    code: u8,
+    enter_input: Option<u32>,
+    leave_input: Option<u32>,
+) -> Vec<ClientAction> {
+    let Some(monitor) = monitor else {
+        return vec![];
+    };
+    let mut actions = vec![];
+    if let Some(value) = enter_input {
+        actions.push(ClientAction::DdcVcp {
+            on: ActionTrigger::Enter,
+            monitor: Some(monitor.clone()),
+            code,
+            value,
+        });
+    }
+    if let Some(value) = leave_input {
+        actions.push(ClientAction::DdcVcp {
+            on: ActionTrigger::Leave,
+            monitor: Some(monitor),
+            code,
+            value,
+        });
+    }
+    actions
 }
 
 async fn discover(timeout: Duration) -> Result<Vec<DiscoveredPeer>, PairingError> {

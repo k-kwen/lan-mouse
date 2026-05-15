@@ -52,7 +52,6 @@ Example:
   -PeerFingerprint "b9:2c:..." `
   -Position left `
   -MacHostname "Kwen-PA-serverui-Macmini.local" `
-  -ControlMyMonitorPath "C:\Tools\ControlMyMonitor.exe" `
   -MonitorSelector "PHLC277" `
   -MacInput 17 `
   -WindowsInput 18
@@ -108,10 +107,9 @@ Behavior:
 
 ### W1: monitor switching without external hooks
 
-The current working Windows setup uses `ControlMyMonitor.exe` with selector
-`PHLC277`. The native DDC path exists, but it needs a more practical monitor
-selector that can match Windows monitor IDs and short IDs. Extend the native
-selector before removing hook fallback from the installer.
+The installer can already write native DDC actions when `MonitorSelector`,
+`MacInput`, and `WindowsInput` are provided without `ControlMyMonitorPath`.
+Hook fallback remains available for monitor models that reject native DDC.
 
 Required selector inputs:
 
