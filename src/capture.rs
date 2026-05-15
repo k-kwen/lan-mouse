@@ -218,6 +218,10 @@ impl CaptureTask {
             .2
     }
 
+    fn has_capture(&self, handle: CaptureHandle) -> bool {
+        self.captures.iter().any(|(h, ..)| *h == handle)
+    }
+
     async fn ensure_ready_for_begin(&self, handle: CaptureHandle) -> bool {
         const TIMEOUT: Duration = Duration::from_millis(1200);
         const POLL: Duration = Duration::from_millis(25);
@@ -333,6 +337,11 @@ impl CaptureTask {
                         }
                     }
 
+                    if !self.has_capture(handle) {
+                        log::debug!("ignoring connection event for unknown capture {handle}");
+                        continue;
+                    }
+
                     match event {
                         // connection acknowlegded => set state to Sending
                         ProtoEvent::Ack(_) => {
@@ -404,6 +413,11 @@ impl CaptureTask {
     ) -> Result<(), CaptureError> {
         let (handle, event) = event;
         log::trace!("({handle}): {event:?}");
+
+        if !self.has_capture(handle) {
+            log::debug!("ignoring capture event for unknown capture {handle}");
+            return Ok(());
+        }
 
         if capture.keys_pressed(&self.release_bind.borrow()) {
             log::info!("releasing capture: release-bind pressed");
