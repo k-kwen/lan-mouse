@@ -306,8 +306,12 @@ pub enum FrontendRequest {
     AuthorizeKey(String, String),
     /// remove fingerprint (fingerprint)
     RemoveAuthorizedKey(String),
-    /// change the hook command
-    UpdateEnterHook(u64, Option<String>),
+    /// change the enter hook command
+    UpdateEnterHook(ClientHandle, Option<String>),
+    /// change the leave hook command
+    UpdateLeaveHook(ClientHandle, Option<String>),
+    /// replace native client actions
+    UpdateActions(ClientHandle, Vec<ClientAction>),
     /// save config file
     SaveConfiguration,
     /// set the wall-press auto-release pixel threshold (0 = disabled)

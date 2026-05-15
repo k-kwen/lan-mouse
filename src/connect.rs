@@ -2,7 +2,8 @@ use crate::client::ClientManager;
 use crate::config::local_commit;
 use crate::crypto::{generate_fingerprint, normalize_fingerprint};
 use crate::discovery::{
-    self, FingerprintCache, PrimaryCache, insert_fingerprint_candidate, normalize_mdns_name,
+    self, FingerprintCache, PrimaryCache, insert_fingerprint_candidate, is_usable_candidate_ip,
+    normalize_mdns_name,
 };
 use lan_mouse_ipc::{ClientHandle, DEFAULT_PORT};
 use lan_mouse_proto::{MAX_EVENT_SIZE, ProtoEvent};
@@ -117,10 +118,12 @@ fn discovery_hint_for(
         .or_else(|| {
             client_manager.get_peer_fingerprint(handle).and_then(|fp| {
                 let key = normalize_fingerprint(&fp);
-                fingerprint_hints
-                    .borrow()
-                    .get(&key)
-                    .and_then(|candidates| candidates.iter().copied().next())
+                fingerprint_hints.borrow().get(&key).and_then(|candidates| {
+                    candidates
+                        .iter()
+                        .copied()
+                        .find(|ip| is_usable_candidate_ip(*ip))
+                })
             })
         })
 }
@@ -134,7 +137,13 @@ fn discovery_candidates_for(
         .get_peer_fingerprint(handle)
         .and_then(|fp| {
             let key = normalize_fingerprint(&fp);
-            fingerprint_hints.borrow().get(&key).cloned()
+            fingerprint_hints.borrow().get(&key).map(|candidates| {
+                candidates
+                    .iter()
+                    .copied()
+                    .filter(|ip| is_usable_candidate_ip(*ip))
+                    .collect()
+            })
         })
         .unwrap_or_default()
 }
@@ -378,6 +387,7 @@ impl LanMouseConnection {
     /// cooldown, keep returning NotConnected silently."
     fn should_attempt(&self, handle: ClientHandle) -> bool {
         let mut ips = self.client_manager.get_ips(handle).unwrap_or_default();
+        ips.retain(|ip| is_usable_candidate_ip(*ip));
         ips.extend(discovery_candidates_for(
             &self.client_manager,
             handle,
@@ -421,6 +431,7 @@ async fn connect_to_handle(
     log::info!("client {handle} connecting ...");
     // sending did not work, figure out active conn.
     if let Some(mut ips_set) = client_manager.get_ips(handle) {
+        ips_set.retain(|ip| is_usable_candidate_ip(*ip));
         ips_set.extend(discovery_candidates_for(
             &client_manager,
             handle,
