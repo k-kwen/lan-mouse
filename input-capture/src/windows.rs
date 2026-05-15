@@ -6,6 +6,9 @@ use std::pin::Pin;
 
 use std::task::ready;
 use tokio::sync::mpsc::{Receiver, channel};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+};
 
 use super::{Capture, CaptureError, CaptureEvent, Position};
 
@@ -36,6 +39,24 @@ impl Capture for WindowsInputCapture {
 
     async fn terminate(&mut self) -> Result<(), CaptureError> {
         Ok(())
+    }
+
+    fn display_bounds(&self) -> Option<(u32, u32)> {
+        let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+        let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+        if width <= 0 || height <= 0 {
+            return None;
+        }
+        Some((width as u32, height as u32))
+    }
+
+    fn display_origin(&self) -> (i32, i32) {
+        unsafe {
+            (
+                GetSystemMetrics(SM_XVIRTUALSCREEN),
+                GetSystemMetrics(SM_YVIRTUALSCREEN),
+            )
+        }
     }
 }
 
