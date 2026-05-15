@@ -24,18 +24,15 @@ pub(crate) struct Capture {
 }
 
 pub(crate) enum ICaptureEvent {
-    /// a client was entered
+    /// The local cursor crossed a capture boundary.
     CaptureBegin(CaptureHandle),
     /// capture disabled
     CaptureDisabled,
     /// capture disabled
     CaptureEnabled,
-    /// A (new) client was entered.
+    /// A remote client acknowledged capture and is ready for input.
     /// In contrast to [`ICaptureEvent::CaptureBegin`] this
-    /// event is only triggered when the capture was
-    /// explicitly released in the meantime by
-    /// either the remote client leaving its device region,
-    /// a new device entering the screen or the release bind.
+    /// event is only triggered after the transport handoff completed.
     ClientEntered(u64),
     /// The local cursor reclaimed input from a remote client
     /// (peer sent a `Leave` — either they released their own
@@ -298,10 +295,20 @@ impl CaptureTask {
                     }
 
                     match event {
-                        // connection acknowlegded => set state to Sending
+                        // Connection acknowledged => input handoff completed.
+                        // Only now notify the service layer so side effects such
+                        // as monitor input switching do not run before the peer
+                        // is actually ready to receive cursor/input events.
                         ProtoEvent::Ack(_) => {
                             log::info!("client {handle} acknowledged the connection!");
+                            let was_waiting_for_this_client = self.state == State::WaitingForAck
+                                && self.active_client == Some(handle);
                             self.state = State::Sending;
+                            if was_waiting_for_this_client {
+                                self.event_tx
+                                    .send(ICaptureEvent::ClientEntered(handle))
+                                    .expect("channel closed");
+                            }
                         }
                         // Peer sent Leave — either they just released
                         // their own outbound capture, or they're
@@ -423,9 +430,6 @@ impl CaptureTask {
         if matches!(event, CaptureEvent::Begin { .. }) && Some(handle) != self.active_client {
             self.state = State::WaitingForAck;
             self.active_client.replace(handle);
-            self.event_tx
-                .send(ICaptureEvent::ClientEntered(handle))
-                .expect("channel closed");
         }
 
         let opposite_pos = to_proto_pos(capture_pos.opposite());
