@@ -7,7 +7,7 @@ use std::{
 
 use slab::Slab;
 
-use lan_mouse_ipc::{ClientConfig, ClientHandle, ClientState, Position};
+use lan_mouse_ipc::{ClientAction, ClientConfig, ClientHandle, ClientState, Position};
 
 use crate::config::ConfigClient;
 
@@ -277,6 +277,20 @@ impl ClientManager {
         }
     }
 
+    /// update the leave hook command of the client
+    pub(crate) fn set_leave_hook(&self, handle: ClientHandle, leave_hook: Option<String>) {
+        if let Some((c, _s)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            c.cmd_leave = leave_hook;
+        }
+    }
+
+    /// replace native actions for the client
+    pub(crate) fn set_actions(&self, handle: ClientHandle, actions: Vec<ClientAction>) {
+        if let Some((c, _s)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            c.actions = actions;
+        }
+    }
+
     /// set resolving status of the client
     pub(crate) fn set_resolving(&self, handle: ClientHandle, status: bool) {
         if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
@@ -300,7 +314,7 @@ impl ClientManager {
             .and_then(|(c, _)| c.cmd_leave.clone())
     }
 
-    pub(crate) fn get_actions(&self, handle: ClientHandle) -> Vec<lan_mouse_ipc::ClientAction> {
+    pub(crate) fn get_actions(&self, handle: ClientHandle) -> Vec<ClientAction> {
         self.clients
             .borrow()
             .get(handle as usize)

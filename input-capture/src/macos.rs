@@ -101,7 +101,16 @@ impl InputCaptureState {
                 || (position == Position::Top && (location.y + relative_y) <= self.bounds.ymin)
                 || (position == Position::Bottom && (location.y + relative_y) >= self.bounds.ymax)
             {
-                log::debug!("Crossed barrier into position: {position:?}");
+                // Human-error guard: require ⌘ to be held in order to cross
+                // the barrier. Without ⌘, return None — capture never starts,
+                // and macOS naturally clamps the cursor at the edge. With ⌘,
+                // the existing modifier-sync logic emits a Modifiers event on
+                // the first post-capture motion so the peer sees ⌘ pressed.
+                if !event.get_flags().contains(CGEventFlags::CGEventFlagCommand) {
+                    log::trace!("Crossed barrier into {position:?} but ⌘ not held — guarded");
+                    return None;
+                }
+                log::info!("Crossed barrier into position: {position:?} (⌘ held)");
                 return Some(position);
             }
         }
@@ -165,6 +174,8 @@ impl InputCaptureState {
                     "[release-warp] handle_producer_event Release: current_pos={:?} warp_target={warp_target:?}",
                     self.current_pos
                 );
+                release_host_modifiers();
+                self.modifier_state = XMods::empty();
                 if self.current_pos.is_some() {
                     // Warp BEFORE clearing current_pos so the
                     // event-tap callback can't see Some(pos) and
@@ -229,6 +240,33 @@ impl InputCaptureState {
             }
         };
         Ok(())
+    }
+}
+
+fn release_host_modifiers() {
+    const MODIFIER_KEYCODES: &[u16] = &[
+        0x38, // left shift
+        0x3c, // right shift
+        0x3b, // left control
+        0x3e, // right control
+        0x3a, // left option
+        0x3d, // right option
+        0x37, // left command
+        0x36, // right command
+    ];
+
+    let Ok(event_source) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState) else {
+        log::warn!("failed to create CGEventSource for modifier release");
+        return;
+    };
+
+    for &key in MODIFIER_KEYCODES {
+        let Ok(event) = CGEvent::new_keyboard_event(event_source.clone(), key, false) else {
+            log::warn!("failed to create modifier key-up event for keycode {key}");
+            continue;
+        };
+        event.set_flags(CGEventFlags::empty());
+        event.post(CGEventTapLocation::HID);
     }
 }
 

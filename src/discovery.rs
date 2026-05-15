@@ -33,6 +33,7 @@ use std::{
     net::{IpAddr, Ipv4Addr},
     path::Path,
     rc::Rc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
@@ -44,6 +45,7 @@ use crate::crypto::normalize_fingerprint;
 pub(crate) const SERVICE_TYPE: &str = "_lan-mouse._udp.local.";
 pub(crate) const TXT_PRIMARY_KEY: &str = "primary";
 pub(crate) const TXT_FINGERPRINT_KEY: &str = "fp";
+const LAST_SUCCESS_TTL: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 
 /// Cross-platform: IP of the interface that owns the default route.
 ///
@@ -72,6 +74,20 @@ pub(crate) fn strip_trailing_dot(s: &str) -> &str {
     s.strip_suffix('.').unwrap_or(s)
 }
 
+fn strip_bonjour_collision_suffix(s: &str) -> &str {
+    let Some((base, suffix)) = s.rsplit_once(" (") else {
+        return s;
+    };
+    let Some(number) = suffix.strip_suffix(')') else {
+        return s;
+    };
+    if number.chars().all(|c| c.is_ascii_digit()) {
+        base
+    } else {
+        s
+    }
+}
+
 /// Pull the service-instance label off a Bonjour fullname.
 ///
 /// `mdns-sd` returns fullnames as `"<instance>.<service-type>"` where
@@ -97,7 +113,15 @@ pub(crate) fn instance_from_fullname<'a>(fullname: &'a str, service_type: &str) 
 pub(crate) fn normalize_mdns_name(s: &str) -> String {
     let s = strip_trailing_dot(s);
     let s = s.strip_suffix(".local").unwrap_or(s);
+    let s = strip_bonjour_collision_suffix(s);
     s.to_ascii_lowercase()
+}
+
+pub(crate) fn is_usable_candidate_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V6(ip) if ip.is_unicast_link_local() => false,
+        _ => true,
+    }
 }
 
 /// Shared `peer_hostname -> primary_ipv4` map, populated by Discovery
@@ -120,7 +144,7 @@ pub(crate) fn insert_fingerprint_candidate(
     ip: IpAddr,
 ) {
     let fingerprint = normalize_fingerprint(fingerprint);
-    if fingerprint.is_empty() {
+    if fingerprint.is_empty() || !is_usable_candidate_ip(ip) {
         return;
     }
     cache
@@ -132,7 +156,42 @@ pub(crate) fn insert_fingerprint_candidate(
 
 #[derive(Default, Deserialize, Serialize)]
 struct LastSuccessFile {
-    fingerprints: HashMap<String, HashSet<IpAddr>>,
+    fingerprints: HashMap<String, LastSuccessEntry>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(untagged)]
+enum LastSuccessEntry {
+    Timed {
+        ips: HashSet<IpAddr>,
+        updated_at_unix: u64,
+    },
+    Legacy(HashSet<IpAddr>),
+}
+
+impl LastSuccessEntry {
+    fn ips(&self) -> &HashSet<IpAddr> {
+        match self {
+            Self::Timed { ips, .. } => ips,
+            Self::Legacy(ips) => ips,
+        }
+    }
+
+    fn is_expired(&self, now: u64) -> bool {
+        match self {
+            Self::Timed {
+                updated_at_unix, ..
+            } => now.saturating_sub(*updated_at_unix) > LAST_SUCCESS_TTL.as_secs(),
+            Self::Legacy(_) => false,
+        }
+    }
+}
+
+fn now_unix_secs() -> io::Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_secs())
 }
 
 pub(crate) fn load_last_success_candidates(
@@ -145,10 +204,16 @@ pub(crate) fn load_last_success_candidates(
     let raw = fs::read_to_string(path)?;
     let last_success = toml::from_str::<LastSuccessFile>(&raw)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let now = now_unix_secs()?;
     let mut loaded = 0usize;
-    for (fingerprint, ips) in last_success.fingerprints {
-        for ip in ips {
-            insert_fingerprint_candidate(cache, &fingerprint, ip);
+    let mut expired = 0usize;
+    for (fingerprint, entry) in last_success.fingerprints {
+        if entry.is_expired(now) {
+            expired += 1;
+            continue;
+        }
+        for ip in entry.ips() {
+            insert_fingerprint_candidate(cache, &fingerprint, *ip);
             loaded += 1;
         }
     }
@@ -156,6 +221,12 @@ pub(crate) fn load_last_success_candidates(
         "loaded {loaded} last-success peer address candidate(s) from {:?}",
         path
     );
+    if expired > 0 {
+        log::info!(
+            "ignored {expired} expired last-success entries from {:?}",
+            path
+        );
+    }
     Ok(())
 }
 
@@ -174,11 +245,23 @@ pub(crate) fn persist_last_success_candidate(
     } else {
         LastSuccessFile::default()
     };
-    last_success
+    if !is_usable_candidate_ip(ip) {
+        return Ok(());
+    }
+    let now = now_unix_secs()?;
+    let mut ips = last_success
         .fingerprints
-        .entry(fingerprint)
-        .or_default()
-        .insert(ip);
+        .remove(&fingerprint)
+        .map(|entry| entry.ips().clone())
+        .unwrap_or_default();
+    ips.insert(ip);
+    last_success.fingerprints.insert(
+        fingerprint,
+        LastSuccessEntry::Timed {
+            ips,
+            updated_at_unix: now,
+        },
+    );
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -195,6 +278,11 @@ pub(crate) struct Discovery {
     /// Fullname of our registered service, kept so we can unregister
     /// on shutdown / before re-registering.
     registered_fullname: Option<String>,
+    /// Last registration identity. The periodic refresh loop can keep
+    /// the current advertisement untouched while IP and port are
+    /// unchanged.
+    last_registered_primary: Option<Ipv4Addr>,
+    last_registered_port: Option<u16>,
     /// Shared cache (see [`PrimaryCache`]).
     primary_cache: PrimaryCache,
     /// Shared cache (see [`FingerprintCache`]).
@@ -234,11 +322,17 @@ impl Discovery {
         }
         match ServiceDaemon::new() {
             Ok(daemon) => {
-                let browse_task =
-                    start_browse(&daemon, primary_cache.clone(), fingerprint_cache.clone());
+                let browse_task = start_browse(
+                    &daemon,
+                    primary_cache.clone(),
+                    fingerprint_cache.clone(),
+                    local_fingerprint.clone(),
+                );
                 let mut this = Self {
                     daemon: Some(daemon),
                     registered_fullname: None,
+                    last_registered_primary: None,
+                    last_registered_port: None,
                     primary_cache,
                     fingerprint_cache,
                     local_fingerprint,
@@ -264,6 +358,8 @@ impl Discovery {
         Self {
             daemon: None,
             registered_fullname: None,
+            last_registered_primary: None,
+            last_registered_port: None,
             primary_cache,
             fingerprint_cache,
             local_fingerprint,
@@ -279,11 +375,6 @@ impl Discovery {
         let Some(daemon) = self.daemon.as_ref() else {
             return;
         };
-        // Drop the old registration first so we don't leave stale
-        // TXT records floating on the network.
-        if let Some(old) = self.registered_fullname.take() {
-            let _ = daemon.unregister(&old);
-        }
         let host = local_hostname();
         let host_record = format!("{host}.local.");
         let primary = match primary_ipv4() {
@@ -296,6 +387,12 @@ impl Discovery {
                 return;
             }
         };
+        if self.registered_fullname.is_some()
+            && self.last_registered_primary == Some(primary)
+            && self.last_registered_port == Some(self.port)
+        {
+            return;
+        }
         let mut props = HashMap::new();
         props.insert(TXT_PRIMARY_KEY.to_string(), primary.to_string());
         props.insert(
@@ -317,6 +414,12 @@ impl Discovery {
             }
         };
         let fullname = info.get_fullname().to_string();
+        // Drop the old registration after the new service info is
+        // buildable. A transient interface read failure must not tear
+        // down a still-valid advertisement.
+        if let Some(old) = self.registered_fullname.take() {
+            let _ = daemon.unregister(&old);
+        }
         match daemon.register(info) {
             Ok(()) => {
                 log::info!(
@@ -325,8 +428,14 @@ impl Discovery {
                     fp = self.local_fingerprint.as_str(),
                 );
                 self.registered_fullname = Some(fullname);
+                self.last_registered_primary = Some(primary);
+                self.last_registered_port = Some(self.port);
             }
-            Err(e) => log::warn!("mdns register failed: {e}"),
+            Err(e) => {
+                self.last_registered_primary = None;
+                self.last_registered_port = None;
+                log::warn!("mdns register failed: {e}");
+            }
         }
     }
 
@@ -335,9 +444,7 @@ impl Discovery {
     /// active default-route interface even when interface changes
     /// don't arrive through if-watch.
     pub(crate) fn refresh(&mut self) {
-        if self.daemon.is_some() {
-            self.register();
-        }
+        self.register();
     }
 
     /// Re-register with a new port (config changed).
@@ -377,6 +484,8 @@ impl Discovery {
             }
             let _ = daemon.shutdown();
         }
+        self.last_registered_primary = None;
+        self.last_registered_port = None;
         if let Some(task) = self.browse_task.take() {
             task.abort();
         }
@@ -399,6 +508,7 @@ fn start_browse(
     daemon: &ServiceDaemon,
     primary_cache: Rc<RefCell<HashMap<String, IpAddr>>>,
     fingerprint_cache: Rc<RefCell<HashMap<String, HashSet<IpAddr>>>>,
+    local_fingerprint: String,
 ) -> Option<JoinHandle<()>> {
     let receiver = match daemon.browse(SERVICE_TYPE) {
         Ok(rx) => rx,
@@ -407,7 +517,10 @@ fn start_browse(
             return None;
         }
     };
+    let local_fingerprint = normalize_fingerprint(&local_fingerprint);
+    let local_name = normalize_mdns_name(&local_hostname());
     Some(spawn_local(async move {
+        let mut seen_services: HashMap<String, (IpAddr, u16, Option<String>)> = HashMap::new();
         while let Ok(event) = receiver.recv_async().await {
             match event {
                 ServiceEvent::ServiceResolved(resolved) => {
@@ -425,21 +538,40 @@ fn start_browse(
                     let key = normalize_mdns_name(instance);
                     let target = strip_trailing_dot(resolved.get_hostname());
                     let fingerprint = resolved.get_property_val_str(TXT_FINGERPRINT_KEY);
-                    log::info!(
-                        "mdns: peer instance={key} (target={target}) announces primary={ip} \
-                         (port={port}, fp={fingerprint:?})",
-                        port = resolved.get_port(),
-                    );
+                    let normalized_fingerprint = fingerprint.map(normalize_fingerprint);
+                    if normalized_fingerprint.as_deref() == Some(local_fingerprint.as_str())
+                        || (key == local_name && normalize_mdns_name(target) == local_name)
+                    {
+                        log::debug!("mdns: ignoring our own service announcement {key}");
+                        continue;
+                    }
+                    let signature = (ip, resolved.get_port(), normalized_fingerprint.clone());
+                    let first_or_changed = seen_services.get(&key) != Some(&signature);
+                    if first_or_changed {
+                        log::info!(
+                            "mdns: peer instance={key} (target={target}) announces primary={ip} \
+                             (port={port}, fp={fingerprint:?})",
+                            port = resolved.get_port(),
+                        );
+                    } else {
+                        log::debug!(
+                            "mdns: peer instance={key} refresh primary={ip} (port={port})",
+                            port = resolved.get_port(),
+                        );
+                    }
+                    seen_services.insert(key.clone(), signature);
                     primary_cache.borrow_mut().insert(key, ip);
-                    if let Some(fingerprint) = fingerprint {
-                        let fingerprint = normalize_fingerprint(fingerprint);
+                    if let Some(fingerprint) = normalized_fingerprint {
                         if !fingerprint.is_empty() {
                             let mut candidates = resolved
                                 .get_addresses()
                                 .iter()
                                 .map(|addr| addr.to_ip_addr())
+                                .filter(|ip| is_usable_candidate_ip(*ip))
                                 .collect::<HashSet<_>>();
-                            candidates.insert(ip);
+                            if is_usable_candidate_ip(ip) {
+                                candidates.insert(ip);
+                            }
                             fingerprint_cache
                                 .borrow_mut()
                                 .insert(fingerprint, candidates);
@@ -483,6 +615,49 @@ mod tests {
         let loaded = cache.borrow();
         let ips = loaded.get("aa:bb").expect("fingerprint cache entry");
         assert!(ips.contains(&"192.168.10.155".parse().unwrap()));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn normalizes_bonjour_collision_suffix() {
+        assert_eq!(
+            normalize_mdns_name("sangwha-KWEN (2).local."),
+            "sangwha-kwen"
+        );
+    }
+
+    #[test]
+    fn skips_link_local_ipv6_candidates() {
+        let cache: FingerprintCache = Default::default();
+        insert_fingerprint_candidate(&cache, "aa:bb", "fe80::1".parse().unwrap());
+        assert!(cache.borrow().is_empty());
+    }
+
+    #[test]
+    fn ignores_expired_last_success_candidates() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("lan-mouse-last-success-expired-{nonce}.toml"));
+        let stale = now_unix_secs().expect("clock") - LAST_SUCCESS_TTL.as_secs() - 1;
+        fs::write(
+            &path,
+            format!(
+                r#"
+                [fingerprints."aa:bb"]
+                ips = ["192.168.10.155"]
+                updated_at_unix = {stale}
+                "#
+            ),
+        )
+        .expect("write stale cache");
+
+        let cache: FingerprintCache = Default::default();
+        load_last_success_candidates(&cache, &path).expect("load candidates");
+        assert!(cache.borrow().is_empty());
 
         let _ = fs::remove_file(path);
     }

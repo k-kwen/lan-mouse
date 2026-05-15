@@ -33,6 +33,15 @@ function Escape-BatchString {
     $Value.Replace("%", "%%")
 }
 
+function Quote-TaskArgument {
+    param([Parameter(Mandatory = $true)][string] $Value)
+    if ($Value -match '[\s"]') {
+        '"' + ($Value -replace '"', '\"') + '"'
+    } else {
+        $Value
+    }
+}
+
 function Require-File {
     param([Parameter(Mandatory = $true)][string] $Path)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
@@ -91,6 +100,9 @@ if ($PSCmdlet.ShouldProcess($InstallDir, "Install lan-mouse headless runtime")) 
             "@echo off",
             ('"{0}" /SetValueIfNeeded "{1}" 60 {2}' -f $batControl, $batMonitor, $WindowsInput)
         ) | Set-Content -LiteralPath $LeaveHook -Encoding ASCII
+    } else {
+        Remove-Item -LiteralPath (Join-Path $InstallDir "hook-enter.bat") -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath (Join-Path $InstallDir "hook-leave.bat") -Force -ErrorAction SilentlyContinue
     }
 
     $PairArgs = @(
@@ -121,25 +133,19 @@ if ($PSCmdlet.ShouldProcess($InstallDir, "Install lan-mouse headless runtime")) 
         throw "lan-mouse pair failed with exit code $LASTEXITCODE"
     }
 
-    @(
-        "@echo off",
-        "setlocal",
-        ('"{0}" --log-file "{1}" --log-level info run' -f (Escape-BatchString $ExeDest), (Escape-BatchString $LogPath))
-    ) | Set-Content -LiteralPath $DaemonBat -Encoding ASCII
+    Remove-Item -LiteralPath $DaemonBat -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $LauncherVbs -Force -ErrorAction SilentlyContinue
 
-    @(
-        'Set shell = CreateObject("WScript.Shell")',
-        'If WScript.Arguments.Count = 0 Then WScript.Quit 1',
-        'shell.Run """" & WScript.Arguments(0) & """", 0, False'
-    ) | Set-Content -LiteralPath $LauncherVbs -Encoding ASCII
+    $RunArgsList = @("--log-file", $LogPath, "--log-level", "info", "run")
+    $RunArgs = ($RunArgsList | ForEach-Object { Quote-TaskArgument $_ }) -join " "
 
     if (-not $NoTask) {
-        $ActionArgs = ('"{0}" "{1}"' -f $LauncherVbs, $DaemonBat)
-        $Action = New-ScheduledTaskAction -Execute "$env:WINDIR\System32\wscript.exe" -Argument $ActionArgs
+        $Action = New-ScheduledTaskAction -Execute $ExeDest -Argument $RunArgs
         $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
         $Settings = New-ScheduledTaskSettingsSet `
             -AllowStartIfOnBatteries `
             -DontStopIfGoingOnBatteries `
+            -Hidden `
             -StartWhenAvailable `
             -RestartCount 3 `
             -RestartInterval (New-TimeSpan -Minutes 1)
@@ -157,7 +163,7 @@ if ($PSCmdlet.ShouldProcess($InstallDir, "Install lan-mouse headless runtime")) 
             Start-Sleep -Seconds 2
         }
     } elseif (-not $NoStart) {
-        Start-Process -FilePath $DaemonBat -WindowStyle Hidden
+        Start-Process -FilePath $ExeDest -ArgumentList $RunArgsList -WindowStyle Hidden
         Start-Sleep -Seconds 2
     }
 

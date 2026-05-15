@@ -206,6 +206,37 @@ impl CaptureTask {
             .map(|(_, pos, capture_type)| (*pos, *capture_type))
     }
 
+    fn has_capture(&self, handle: CaptureHandle) -> bool {
+        self.captures.iter().any(|(h, ..)| *h == handle)
+    }
+
+    async fn ensure_ready_for_begin(&self, handle: CaptureHandle) -> bool {
+        const TIMEOUT: Duration = Duration::from_millis(1200);
+        const POLL: Duration = Duration::from_millis(25);
+
+        if self.conn.is_ready(handle).await {
+            return true;
+        }
+        self.conn.ensure_connected(handle).await;
+
+        log::info!("client {handle} is not ready yet; waiting for initial connection");
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(POLL) => {}
+                _ = self.cancellation_token.cancelled() => return false,
+            }
+
+            if self.conn.is_ready(handle).await {
+                return true;
+            }
+
+            if Instant::now() >= deadline {
+                return self.conn.is_ready(handle).await;
+            }
+        }
+    }
+
     async fn run(mut self) {
         loop {
             if let Err(e) = self.do_capture().await {
@@ -292,6 +323,11 @@ impl CaptureTask {
                             // only `Ack` and `Leave` are relevant
                             continue
                         }
+                    }
+
+                    if !self.has_capture(handle) {
+                        log::debug!("ignoring connection event for unknown capture {handle}");
+                        continue;
                     }
 
                     match event {
@@ -419,9 +455,9 @@ impl CaptureTask {
             return Ok(());
         }
 
-        if matches!(event, CaptureEvent::Begin { .. }) && !self.conn.ensure_connected(handle).await
+        if matches!(event, CaptureEvent::Begin { .. }) && !self.ensure_ready_for_begin(handle).await
         {
-            log::info!("releasing capture: client {handle} is not connected yet");
+            log::info!("releasing capture: client {handle} is not ready yet");
             capture.release().await?;
             return Ok(());
         }

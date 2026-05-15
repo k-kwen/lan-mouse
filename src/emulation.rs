@@ -141,6 +141,7 @@ impl ListenTask {
     async fn run(mut self) {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         let mut last_response = HashMap::new();
+        let mut last_enter_at = HashMap::new();
         let mut rejected_connections = HashMap::new();
         loop {
             select! {
@@ -150,6 +151,19 @@ impl ListenTask {
                         last_response.insert(addr, Instant::now());
                         match event {
                             ProtoEvent::Enter(pos) => {
+                                let now = Instant::now();
+                                if last_enter_at
+                                    .get(&addr)
+                                    .is_some_and(|last| now.duration_since(*last) < Duration::from_millis(50))
+                                {
+                                    log::debug!("ignoring duplicate Enter from {addr}");
+                                    self.listener.reply(addr, ProtoEvent::Ack(0)).await;
+                                    if let Some((width, height)) = self.emulation_proxy.display_bounds() {
+                                        self.listener.reply(addr, ProtoEvent::Bounds { width, height }).await;
+                                    }
+                                    continue;
+                                }
+                                last_enter_at.insert(addr, now);
                                 if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
                                     log::info!("releasing capture: {addr} entered this device");
                                     self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
@@ -280,6 +294,7 @@ impl ListenTask {
                             log::warn!("releasing keys: {addr} not responding!");
                             self.emulation_proxy.remove(addr);
                             self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
+                            last_enter_at.remove(&addr);
                             false
                         } else {
                             true
