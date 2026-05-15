@@ -6,6 +6,7 @@ use lan_mouse::{
     capture_test,
     config::{self, Command, Config, ConfigError},
     emulation_test,
+    pairing::{self, PairingError},
     service::{Service, ServiceError},
 };
 use lan_mouse_cli::CliError;
@@ -37,6 +38,8 @@ enum LanMouseError {
     Gtk(#[from] GtkError),
     #[error(transparent)]
     Cli(#[from] CliError),
+    #[error(transparent)]
+    Pairing(#[from] PairingError),
 }
 
 fn main() {
@@ -56,6 +59,8 @@ fn run() -> Result<(), LanMouseError> {
         Some(command) => match command {
             Command::TestEmulation(args) => run_async(emulation_test::run(config, args))?,
             Command::TestCapture(args) => run_async(capture_test::run(config, args))?,
+            Command::Discover(args) => run_async(pairing::discover_command(args))?,
+            Command::Pair(args) => run_async(pairing::pair_command(config, args))?,
             Command::Cli(cli_args) => run_async(lan_mouse_cli::run(cli_args))?,
             Command::Daemon | Command::Run => {
                 // if daemon is specified we run the service

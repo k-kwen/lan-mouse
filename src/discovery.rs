@@ -41,9 +41,9 @@ use tokio::task::{JoinHandle, spawn_local};
 
 use crate::crypto::normalize_fingerprint;
 
-const SERVICE_TYPE: &str = "_lan-mouse._udp.local.";
-const TXT_PRIMARY_KEY: &str = "primary";
-const TXT_FINGERPRINT_KEY: &str = "fp";
+pub(crate) const SERVICE_TYPE: &str = "_lan-mouse._udp.local.";
+pub(crate) const TXT_PRIMARY_KEY: &str = "primary";
+pub(crate) const TXT_FINGERPRINT_KEY: &str = "fp";
 
 /// Cross-platform: IP of the interface that owns the default route.
 ///
@@ -68,7 +68,7 @@ fn local_hostname() -> String {
 /// stored as fully-qualified ("foo.local."); user config typically
 /// writes them without the trailing dot ("foo.local"). Normalize
 /// to compare.
-fn strip_trailing_dot(s: &str) -> &str {
+pub(crate) fn strip_trailing_dot(s: &str) -> &str {
     s.strip_suffix('.').unwrap_or(s)
 }
 
@@ -83,7 +83,7 @@ fn strip_trailing_dot(s: &str) -> &str {
 /// matches the config hostname even when the announcer's SRV target
 /// has macOS-style suffixes (`Foo.local` vs `Foo-2.local`) or other
 /// drift.
-fn instance_from_fullname<'a>(fullname: &'a str, service_type: &str) -> &'a str {
+pub(crate) fn instance_from_fullname<'a>(fullname: &'a str, service_type: &str) -> &'a str {
     let suffix = format!(".{service_type}");
     fullname.strip_suffix(&suffix).unwrap_or(fullname)
 }

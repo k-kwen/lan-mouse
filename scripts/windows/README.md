@@ -4,6 +4,9 @@ These scripts install the headless Rust runtime for the current Windows user.
 They are intended to be bundled with `lan-mouse.exe` in
 `lan-mouse-windows-headless-x86_64.zip`.
 
+The installer delegates peer setup to `lan-mouse.exe pair`, so the config is
+written by the Rust binary, not by hand-built PowerShell TOML.
+
 ## Install
 
 Run PowerShell from the extracted package directory:
@@ -31,6 +34,12 @@ For the current Philips monitor switching setup:
 
 `PeerFingerprint` is the Mac key. The generated config intentionally keeps
 `ips = []`; dynamic addresses are learned at runtime.
+
+You can inspect visible peers before installing:
+
+```powershell
+.\lan-mouse.exe discover --json
+```
 
 ## Uninstall
 

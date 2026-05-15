@@ -10,4 +10,5 @@ mod dns;
 mod emulation;
 pub mod emulation_test;
 mod listen;
+pub mod pairing;
 pub mod service;

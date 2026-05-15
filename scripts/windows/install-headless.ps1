@@ -27,11 +27,6 @@ function Resolve-InstallPath {
     [Environment]::ExpandEnvironmentVariables($Path)
 }
 
-function Escape-TomlString {
-    param([Parameter(Mandatory = $true)][string] $Value)
-    $Value.Replace("\", "\\").Replace('"', '\"')
-}
-
 function Escape-BatchString {
     param([Parameter(Mandatory = $true)][string] $Value)
     $Value.Replace("%", "%%")
@@ -70,19 +65,6 @@ if ($PSCmdlet.ShouldProcess($InstallDir, "Install lan-mouse headless runtime")) 
 
     Copy-Item -LiteralPath $ExePath -Destination $ExeDest -Force
 
-    $configLines = New-Object System.Collections.Generic.List[string]
-    $configLines.Add("port = $Port")
-    $configLines.Add("mdns_discovery = true")
-    $configLines.Add("")
-    $configLines.Add("[[clients]]")
-    if (-not [string]::IsNullOrWhiteSpace($MacHostname)) {
-        $configLines.Add(('hostname = "{0}"' -f (Escape-TomlString $MacHostname.Trim())))
-    }
-    $configLines.Add(('peer_fingerprint = "{0}"' -f (Escape-TomlString $PeerFingerprint)))
-    $configLines.Add("ips = []")
-    $configLines.Add(('position = "{0}"' -f $Position))
-    $configLines.Add("activate_on_startup = true")
-
     $UseMonitorHooks = -not [string]::IsNullOrWhiteSpace($ControlMyMonitorPath) -and
         -not [string]::IsNullOrWhiteSpace($MonitorSelector) -and
         $MacInput -ne 0 -and
@@ -106,15 +88,29 @@ if ($PSCmdlet.ShouldProcess($InstallDir, "Install lan-mouse headless runtime")) 
             "@echo off",
             ('"{0}" /SetValueIfNeeded "{1}" 60 {2}' -f $batControl, $batMonitor, $WindowsInput)
         ) | Set-Content -LiteralPath $LeaveHook -Encoding ASCII
-
-        $configLines.Add(('enter_hook = "{0}"' -f (Escape-TomlString $EnterHook)))
-        $configLines.Add(('leave_hook = "{0}"' -f (Escape-TomlString $LeaveHook)))
     }
 
-    $configLines.Add("")
-    $configLines.Add("[authorized_fingerprints]")
-    $configLines.Add(('"{0}" = "{1}"' -f (Escape-TomlString $PeerFingerprint), (Escape-TomlString $PeerLabel)))
-    $configLines | Set-Content -LiteralPath $ConfigPath -Encoding UTF8
+    $PairArgs = @(
+        "--config", $ConfigPath,
+        "pair",
+        "--mac-key", $PeerFingerprint,
+        "--position", $Position,
+        "--label", $PeerLabel,
+        "--port", ([string] $Port),
+        "--discover-timeout-ms", "2500"
+    )
+    if (-not [string]::IsNullOrWhiteSpace($MacHostname)) {
+        $PairArgs += @("--hostname", $MacHostname.Trim())
+    }
+    if ($UseMonitorHooks) {
+        $PairArgs += @("--enter-hook", $EnterHook)
+        $PairArgs += @("--leave-hook", $LeaveHook)
+    }
+
+    & $ExeDest @PairArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "lan-mouse pair failed with exit code $LASTEXITCODE"
+    }
 
     @(
         "@echo off",

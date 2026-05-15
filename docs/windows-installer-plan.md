@@ -61,12 +61,17 @@ Example:
 The hostname is a label and DNS fallback, not the trust anchor. The
 fingerprint is the trust anchor. The generated client keeps `ips = []`.
 
-## Remaining Rust work for full auto-pairing
+## Rust pairing commands
 
-### W1: `lan-mouse discover`
+### `lan-mouse discover`
 
-Add a top-level command that browses `_lan-mouse._udp.local` for a short window
-and prints JSON:
+Browses `_lan-mouse._udp.local` for a short window and prints discovered peers:
+
+```powershell
+lan-mouse.exe discover --json
+```
+
+JSON shape:
 
 ```json
 [
@@ -80,12 +85,12 @@ and prints JSON:
 ]
 ```
 
-This command must not require the daemon to be running. It should reuse the
-same mDNS service type and TXT keys as `src/discovery.rs`.
+This command does not require the daemon to be running. It reuses the same mDNS
+service type and TXT keys as `src/discovery.rs`.
 
-### W2: `lan-mouse pair`
+### `lan-mouse pair`
 
-Add a top-level command that writes config directly:
+Writes config directly:
 
 ```powershell
 lan-mouse.exe pair --mac-key "b9:2c:..." --position left --hostname optional
@@ -96,9 +101,12 @@ Behavior:
 - browse mDNS and prefer a discovered peer whose TXT `fp` matches `--mac-key`
 - write a client with `peer_fingerprint`, `ips = []`, and `activate_on_startup`
 - add the Mac fingerprint under `[authorized_fingerprints]`
-- run a connection smoke test when the daemon is already active
+- keep hook fallback values when the installer passes `--enter-hook` and
+  `--leave-hook`
 
-### W3: monitor switching without external hooks
+## Remaining Rust work
+
+### W1: monitor switching without external hooks
 
 The current working Windows setup uses `ControlMyMonitor.exe` with selector
 `PHLC277`. The native DDC path exists, but it needs a more practical monitor
@@ -112,11 +120,12 @@ Required selector inputs:
 - display device name, e.g. `\\.\DISPLAY10`
 - short monitor ID, e.g. `PHLC277`
 
-### W4: MSI/MSIX wrapper
+### W2: MSI/MSIX wrapper
 
-After W1-W3, wrap the same headless package in an MSI or MSIX. Keep the
-PowerShell installer as the transparent, debuggable backend first; the wrapper
-should only provide UI and elevation-free per-user install ergonomics.
+After native monitor selection is strong enough, wrap the same headless package
+in an MSI or MSIX. Keep the PowerShell installer as the transparent,
+debuggable backend first; the wrapper should only provide UI and elevation-free
+per-user install ergonomics.
 
 ## Verification loop
 

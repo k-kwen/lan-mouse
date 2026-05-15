@@ -147,6 +147,10 @@ pub enum Command {
     TestEmulation(TestEmulationArgs),
     /// test input capture
     TestCapture(TestCaptureArgs),
+    /// discover lan-mouse peers on the local network
+    Discover(crate::pairing::DiscoverArgs),
+    /// write a dynamic-IP-safe peer configuration
+    Pair(crate::pairing::PairArgs),
     /// Lan Mouse commandline interface
     Cli(CliArgs),
     /// run in daemon mode
@@ -522,6 +526,13 @@ impl Config {
             .port
             .or(self.config_toml.as_ref().and_then(|c| c.port))
             .unwrap_or(DEFAULT_PORT)
+    }
+
+    pub fn set_port(&mut self, port: u16) {
+        if self.config_toml.is_none() {
+            self.config_toml = Some(Default::default());
+        }
+        self.config_toml.as_mut().expect("config").port = Some(port);
     }
 
     /// list of configured clients
