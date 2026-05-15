@@ -30,6 +30,8 @@ struct Client {
     #[arg(long)]
     hostname: Option<String>,
     #[arg(long)]
+    peer_fingerprint: Option<String>,
+    #[arg(long)]
     port: Option<u16>,
     #[arg(long)]
     ips: Option<Vec<IpAddr>>,
@@ -53,6 +55,11 @@ enum CliSubcommand {
     SetHost {
         id: ClientHandle,
         host: Option<String>,
+    },
+    /// change expected peer certificate fingerprint
+    SetPeerFingerprint {
+        id: ClientHandle,
+        fingerprint: Option<String>,
     },
     /// change port
     SetPort { id: ClientHandle, port: u16 },
@@ -85,6 +92,7 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
     match cmd {
         CliSubcommand::AddClient(Client {
             hostname,
+            peer_fingerprint,
             port,
             ips,
             enter_hook,
@@ -95,6 +103,13 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                     if let Some(hostname) = hostname {
                         tx.request(FrontendRequest::UpdateHostname(handle, Some(hostname)))
                             .await?;
+                    }
+                    if let Some(peer_fingerprint) = peer_fingerprint {
+                        tx.request(FrontendRequest::UpdatePeerFingerprint(
+                            handle,
+                            Some(peer_fingerprint),
+                        ))
+                        .await?;
                     }
                     if let Some(port) = port {
                         tx.request(FrontendRequest::UpdatePort(handle, port))
@@ -127,8 +142,12 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                         let pos = config.pos;
                         let active = state.active;
                         let ips = state.ips;
+                        let peer = config
+                            .peer_fingerprint
+                            .map(|fp| format!(", peer_fingerprint: {fp}"))
+                            .unwrap_or_default();
                         println!(
-                            "id {handle}: {host}:{port} ({pos}) active: {active}, ips: {ips:?}"
+                            "id {handle}: {host}:{port} ({pos}) active: {active}, ips: {ips:?}{peer}"
                         );
                     }
                     break;
@@ -137,6 +156,10 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
         }
         CliSubcommand::SetHost { id, host } => {
             tx.request(FrontendRequest::UpdateHostname(id, host))
+                .await?
+        }
+        CliSubcommand::SetPeerFingerprint { id, fingerprint } => {
+            tx.request(FrontendRequest::UpdatePeerFingerprint(id, fingerprint))
                 .await?
         }
         CliSubcommand::SetPort { id, port } => {

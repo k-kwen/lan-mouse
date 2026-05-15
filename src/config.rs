@@ -1,4 +1,5 @@
 use crate::capture_test::TestCaptureArgs;
+use crate::crypto::normalize_fingerprint;
 use crate::emulation_test::TestEmulationArgs;
 use clap::{Parser, Subcommand, ValueEnum};
 use notify::{EventKind, RecommendedWatcher, Watcher};
@@ -16,7 +17,7 @@ use toml;
 use toml_edit::{self, DocumentMut};
 
 use lan_mouse_cli::CliArgs;
-use lan_mouse_ipc::{DEFAULT_PORT, Position};
+use lan_mouse_ipc::{ClientAction, DEFAULT_PORT, Position};
 
 use input_event::scancode::{
     self,
@@ -86,12 +87,15 @@ struct ConfigToml {
 struct TomlClient {
     hostname: Option<String>,
     host_name: Option<String>,
+    #[serde(alias = "fingerprint")]
+    peer_fingerprint: Option<String>,
     ips: Option<Vec<IpAddr>>,
     port: Option<u16>,
     position: Option<Position>,
     activate_on_startup: Option<bool>,
     enter_hook: Option<String>,
     leave_hook: Option<String>,
+    actions: Option<Vec<ClientAction>>,
 }
 
 impl ConfigToml {
@@ -104,6 +108,14 @@ impl ConfigToml {
 #[derive(Parser, Debug)]
 #[command(author, version=build::CLAP_LONG_VERSION, about, long_about = None)]
 struct Args {
+    /// write logs to this file instead of stderr
+    #[arg(long = "log-file", global = true, value_name = "PATH")]
+    _log_file: Option<PathBuf>,
+
+    /// override log level (also available via LAN_MOUSE_LOG_LEVEL)
+    #[arg(long = "log-level", global = true)]
+    _log_level: Option<String>,
+
     /// the listen port for lan-mouse
     #[arg(short, long)]
     port: Option<u16>,
@@ -139,6 +151,8 @@ pub enum Command {
     Cli(CliArgs),
     /// run in daemon mode
     Daemon,
+    /// run the headless service
+    Run,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
@@ -283,11 +297,13 @@ pub struct Config {
 pub struct ConfigClient {
     pub ips: HashSet<IpAddr>,
     pub hostname: Option<String>,
+    pub peer_fingerprint: Option<String>,
     pub port: u16,
     pub pos: Position,
     pub active: bool,
     pub enter_hook: Option<String>,
     pub leave_hook: Option<String>,
+    pub actions: Vec<ClientAction>,
 }
 
 impl From<TomlClient> for ConfigClient {
@@ -295,18 +311,25 @@ impl From<TomlClient> for ConfigClient {
         let active = toml.activate_on_startup.unwrap_or(false);
         let enter_hook = toml.enter_hook;
         let leave_hook = toml.leave_hook;
+        let actions = toml.actions.unwrap_or_default();
         let hostname = toml.hostname;
+        let peer_fingerprint = toml
+            .peer_fingerprint
+            .map(|fp| normalize_fingerprint(&fp))
+            .filter(|fp| !fp.is_empty());
         let ips = HashSet::from_iter(toml.ips.into_iter().flatten());
         let port = toml.port.unwrap_or(DEFAULT_PORT);
         let pos = toml.position.unwrap_or_default();
         Self {
             ips,
             hostname,
+            peer_fingerprint,
             port,
             pos,
             active,
             enter_hook,
             leave_hook,
+            actions,
         }
     }
 }
@@ -315,6 +338,7 @@ impl From<ConfigClient> for TomlClient {
     fn from(client: ConfigClient) -> Self {
         let hostname = client.hostname;
         let host_name = None;
+        let peer_fingerprint = client.peer_fingerprint;
         let mut ips = client.ips.into_iter().collect::<Vec<_>>();
         ips.sort();
         let ips = Some(ips);
@@ -327,15 +351,22 @@ impl From<ConfigClient> for TomlClient {
         let activate_on_startup = if client.active { Some(true) } else { None };
         let enter_hook = client.enter_hook;
         let leave_hook = client.leave_hook;
+        let actions = if client.actions.is_empty() {
+            None
+        } else {
+            Some(client.actions)
+        };
         Self {
             hostname,
             host_name,
+            peer_fingerprint,
             ips,
             port,
             position,
             activate_on_startup,
             enter_hook,
             leave_hook,
+            actions,
         }
     }
 }
@@ -452,6 +483,10 @@ impl Config {
 
     pub fn config_path(&self) -> &Path {
         &self.config_path
+    }
+
+    pub fn last_success_cache_path(&self) -> PathBuf {
+        self.config_dir.join("last-success.toml")
     }
 
     /// public key fingerprints authorized for connection
@@ -621,5 +656,48 @@ impl Config {
         let _ = self.watch();
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lan_mouse_ipc::{ActionTrigger, ClientAction};
+
+    #[test]
+    fn parses_ddc_vcp_client_action() {
+        let config: ConfigToml = toml::from_str(
+            r#"
+            [[clients]]
+            position = "right"
+            peer_fingerprint = " AA:BB "
+
+            [[clients.actions]]
+            type = "ddc_vcp"
+            on = "enter"
+            monitor = "0"
+            code = 96
+            value = 17
+            "#,
+        )
+        .expect("valid config");
+
+        let mut clients = config.clients.expect("clients");
+        let client = ConfigClient::from(clients.remove(0));
+        assert_eq!(client.peer_fingerprint.as_deref(), Some("aa:bb"));
+        assert_eq!(client.actions.len(), 1);
+        match &client.actions[0] {
+            ClientAction::DdcVcp {
+                on,
+                monitor,
+                code,
+                value,
+            } => {
+                assert_eq!(*on, ActionTrigger::Enter);
+                assert_eq!(monitor.as_deref(), Some("0"));
+                assert_eq!(*code, 96);
+                assert_eq!(*value, 17);
+            }
+        }
     }
 }

@@ -410,6 +410,13 @@ impl CaptureTask {
             return Ok(());
         }
 
+        if matches!(event, CaptureEvent::Begin { .. }) && !self.conn.ensure_connected(handle).await
+        {
+            log::info!("releasing capture: client {handle} is not connected yet");
+            capture.release().await?;
+            return Ok(());
+        }
+
         // activated a new client
         if matches!(event, CaptureEvent::Begin { .. }) && Some(handle) != self.active_client {
             self.state = State::WaitingForAck;

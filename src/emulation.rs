@@ -62,6 +62,7 @@ pub(crate) enum EmulationEvent {
     /// this is the defensive fallback.
     PeerHello {
         addr: SocketAddr,
+        fingerprint: Option<String>,
         commit: [u8; 8],
     },
 }
@@ -204,7 +205,8 @@ impl ListenTask {
                             // the peer is in fact happily talking to us.
                             ProtoEvent::Hello { commit } => {
                                 self.listener.reply(addr, ProtoEvent::Hello { commit: local_commit() }).await;
-                                self.event_tx.send(EmulationEvent::PeerHello { addr, commit }).expect("channel closed");
+                                let fingerprint = self.listener.get_certificate_fingerprint(addr).await;
+                                self.event_tx.send(EmulationEvent::PeerHello { addr, fingerprint, commit }).expect("channel closed");
                             }
                             // Capturing peer told us where on its own
                             // screen the user's cursor was, as a

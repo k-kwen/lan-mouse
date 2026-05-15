@@ -1,4 +1,5 @@
-use env_logger::Env;
+mod logging;
+
 use input_capture::InputCaptureError;
 use input_emulation::InputEmulationError;
 use lan_mouse::{
@@ -39,10 +40,10 @@ enum LanMouseError {
 }
 
 fn main() {
-    // init logging
-    let env = Env::default().filter_or("LAN_MOUSE_LOG_LEVEL", "info");
-    env_logger::init_from_env(env);
-
+    if let Err(e) = logging::init() {
+        eprintln!("failed to initialize logging: {e}");
+        process::exit(1);
+    }
     if let Err(e) = run() {
         log::error!("{e}");
         process::exit(1);
@@ -56,7 +57,7 @@ fn run() -> Result<(), LanMouseError> {
             Command::TestEmulation(args) => run_async(emulation_test::run(config, args))?,
             Command::TestCapture(args) => run_async(capture_test::run(config, args))?,
             Command::Cli(cli_args) => run_async(lan_mouse_cli::run(cli_args))?,
-            Command::Daemon => {
+            Command::Daemon | Command::Run => {
                 // if daemon is specified we run the service
                 match run_async(run_service(config)) {
                     Err(LanMouseError::Service(ServiceError::IpcListen(

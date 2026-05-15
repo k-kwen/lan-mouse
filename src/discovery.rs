@@ -13,12 +13,13 @@
 //! Each lan-mouse instance registers a `_lan-mouse._udp.local.`
 //! Bonjour service whose TXT record advertises `primary=<ip>`, where
 //! `<ip>` is the IPv4 of the interface that owns the default route
-//! (which on macOS reflects service order). The dialer browses the
-//! same service type, looks up the peer instance by hostname, and
-//! prepends the primary IP to its connection-attempt list. If the
-//! peer is on an old version with no advertised service (or mDNS
-//! is firewalled), nothing breaks — we silently fall through to the
-//! existing `connect_any` race.
+//! (which on macOS reflects service order), and `fp=<sha256>` for the
+//! local DTLS certificate fingerprint. The dialer browses the same
+//! service type, looks up the peer instance by hostname, and prepends
+//! the primary IP to its connection-attempt list. If the peer is on an
+//! old version with no advertised service (or mDNS is firewalled),
+//! nothing breaks — we silently fall through to the existing
+//! `connect_any` race.
 //!
 //! The whole subsystem is gated by the `mdns_discovery` config flag
 //! (default true). Toggling it off shuts down the mDNS daemon and
@@ -27,16 +28,22 @@
 
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
+    fs, io,
     net::{IpAddr, Ipv4Addr},
+    path::Path,
     rc::Rc,
 };
 
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use serde::{Deserialize, Serialize};
 use tokio::task::{JoinHandle, spawn_local};
+
+use crate::crypto::normalize_fingerprint;
 
 const SERVICE_TYPE: &str = "_lan-mouse._udp.local.";
 const TXT_PRIMARY_KEY: &str = "primary";
+const TXT_FINGERPRINT_KEY: &str = "fp";
 
 /// Cross-platform: IP of the interface that owns the default route.
 ///
@@ -100,6 +107,85 @@ pub(crate) fn normalize_mdns_name(s: &str) -> String {
 /// publishing/browsing but cached hints stay queryable. A subsequent
 /// re-enable populates fresh entries into the same map.
 pub(crate) type PrimaryCache = Rc<RefCell<HashMap<String, IpAddr>>>;
+/// Shared `peer_fingerprint -> candidate_ips` map. This is the first
+/// step toward making IP addresses a volatile transport detail: when
+/// a configured client has `peer_fingerprint`, the dialer can follow
+/// the mDNS-advertised addresses for that certificate even if the
+/// hostname label changes.
+pub(crate) type FingerprintCache = Rc<RefCell<HashMap<String, HashSet<IpAddr>>>>;
+
+pub(crate) fn insert_fingerprint_candidate(
+    cache: &FingerprintCache,
+    fingerprint: &str,
+    ip: IpAddr,
+) {
+    let fingerprint = normalize_fingerprint(fingerprint);
+    if fingerprint.is_empty() {
+        return;
+    }
+    cache
+        .borrow_mut()
+        .entry(fingerprint)
+        .or_default()
+        .insert(ip);
+}
+
+#[derive(Default, Deserialize, Serialize)]
+struct LastSuccessFile {
+    fingerprints: HashMap<String, HashSet<IpAddr>>,
+}
+
+pub(crate) fn load_last_success_candidates(
+    cache: &FingerprintCache,
+    path: &Path,
+) -> io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let raw = fs::read_to_string(path)?;
+    let last_success = toml::from_str::<LastSuccessFile>(&raw)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let mut loaded = 0usize;
+    for (fingerprint, ips) in last_success.fingerprints {
+        for ip in ips {
+            insert_fingerprint_candidate(cache, &fingerprint, ip);
+            loaded += 1;
+        }
+    }
+    log::info!(
+        "loaded {loaded} last-success peer address candidate(s) from {:?}",
+        path
+    );
+    Ok(())
+}
+
+pub(crate) fn persist_last_success_candidate(
+    path: &Path,
+    fingerprint: &str,
+    ip: IpAddr,
+) -> io::Result<()> {
+    let fingerprint = normalize_fingerprint(fingerprint);
+    if fingerprint.is_empty() {
+        return Ok(());
+    }
+    let mut last_success = if path.exists() {
+        let raw = fs::read_to_string(path)?;
+        toml::from_str::<LastSuccessFile>(&raw).unwrap_or_default()
+    } else {
+        LastSuccessFile::default()
+    };
+    last_success
+        .fingerprints
+        .entry(fingerprint)
+        .or_default()
+        .insert(ip);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let raw = toml::to_string_pretty(&last_success)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    fs::write(path, raw)
+}
 
 pub(crate) struct Discovery {
     /// The mDNS daemon. `None` when the subsystem is disabled (config
@@ -111,6 +197,12 @@ pub(crate) struct Discovery {
     registered_fullname: Option<String>,
     /// Shared cache (see [`PrimaryCache`]).
     primary_cache: PrimaryCache,
+    /// Shared cache (see [`FingerprintCache`]).
+    fingerprint_cache: FingerprintCache,
+    /// Local DTLS certificate fingerprint advertised as `fp=` so
+    /// peers can eventually identify this machine independently of
+    /// whichever IP address DHCP currently assigned.
+    local_fingerprint: String,
     /// Background task that consumes browse events and updates
     /// `primary_cache`. Aborted when discovery is disabled or torn
     /// down.
@@ -129,18 +221,27 @@ impl Discovery {
     /// other process, or the OS lacks the permissions). In both
     /// cases we log a warning and continue without discovery; the
     /// dialer falls back to plain hostname resolution.
-    pub(crate) fn new(port: u16, enabled: bool, primary_cache: PrimaryCache) -> Self {
+    pub(crate) fn new(
+        port: u16,
+        enabled: bool,
+        primary_cache: PrimaryCache,
+        fingerprint_cache: FingerprintCache,
+        local_fingerprint: String,
+    ) -> Self {
         if !enabled {
             log::info!("mdns discovery disabled by config");
-            return Self::inert(port, primary_cache);
+            return Self::inert(port, primary_cache, fingerprint_cache, local_fingerprint);
         }
         match ServiceDaemon::new() {
             Ok(daemon) => {
-                let browse_task = start_browse(&daemon, primary_cache.clone());
+                let browse_task =
+                    start_browse(&daemon, primary_cache.clone(), fingerprint_cache.clone());
                 let mut this = Self {
                     daemon: Some(daemon),
                     registered_fullname: None,
                     primary_cache,
+                    fingerprint_cache,
+                    local_fingerprint,
                     browse_task,
                     port,
                 };
@@ -149,16 +250,23 @@ impl Discovery {
             }
             Err(e) => {
                 log::warn!("mdns ServiceDaemon::new failed: {e}; discovery disabled");
-                Self::inert(port, primary_cache)
+                Self::inert(port, primary_cache, fingerprint_cache, local_fingerprint)
             }
         }
     }
 
-    fn inert(port: u16, primary_cache: PrimaryCache) -> Self {
+    fn inert(
+        port: u16,
+        primary_cache: PrimaryCache,
+        fingerprint_cache: FingerprintCache,
+        local_fingerprint: String,
+    ) -> Self {
         Self {
             daemon: None,
             registered_fullname: None,
             primary_cache,
+            fingerprint_cache,
+            local_fingerprint,
             browse_task: None,
             port,
         }
@@ -190,6 +298,10 @@ impl Discovery {
         };
         let mut props = HashMap::new();
         props.insert(TXT_PRIMARY_KEY.to_string(), primary.to_string());
+        props.insert(
+            TXT_FINGERPRINT_KEY.to_string(),
+            self.local_fingerprint.clone(),
+        );
         let info = match ServiceInfo::new(
             SERVICE_TYPE,
             &host,
@@ -208,8 +320,9 @@ impl Discovery {
         match daemon.register(info) {
             Ok(()) => {
                 log::info!(
-                    "mdns: registered {fullname} on {primary}:{port} (primary interface)",
+                    "mdns: registered {fullname} on {primary}:{port} (primary interface, fp={fp})",
                     port = self.port,
+                    fp = self.local_fingerprint.as_str(),
                 );
                 self.registered_fullname = Some(fullname);
             }
@@ -245,7 +358,13 @@ impl Discovery {
             return;
         }
         if enabled {
-            *self = Self::new(self.port, true, self.primary_cache.clone());
+            *self = Self::new(
+                self.port,
+                true,
+                self.primary_cache.clone(),
+                self.fingerprint_cache.clone(),
+                self.local_fingerprint.clone(),
+            );
         } else {
             self.shutdown();
         }
@@ -279,6 +398,7 @@ impl Drop for Discovery {
 fn start_browse(
     daemon: &ServiceDaemon,
     primary_cache: Rc<RefCell<HashMap<String, IpAddr>>>,
+    fingerprint_cache: Rc<RefCell<HashMap<String, HashSet<IpAddr>>>>,
 ) -> Option<JoinHandle<()>> {
     let receiver = match daemon.browse(SERVICE_TYPE) {
         Ok(rx) => rx,
@@ -304,12 +424,27 @@ fn start_browse(
                     let instance = instance_from_fullname(resolved.get_fullname(), SERVICE_TYPE);
                     let key = normalize_mdns_name(instance);
                     let target = strip_trailing_dot(resolved.get_hostname());
+                    let fingerprint = resolved.get_property_val_str(TXT_FINGERPRINT_KEY);
                     log::info!(
                         "mdns: peer instance={key} (target={target}) announces primary={ip} \
-                         (port={port})",
+                         (port={port}, fp={fingerprint:?})",
                         port = resolved.get_port(),
                     );
                     primary_cache.borrow_mut().insert(key, ip);
+                    if let Some(fingerprint) = fingerprint {
+                        let fingerprint = normalize_fingerprint(fingerprint);
+                        if !fingerprint.is_empty() {
+                            let mut candidates = resolved
+                                .get_addresses()
+                                .iter()
+                                .map(|addr| addr.to_ip_addr())
+                                .collect::<HashSet<_>>();
+                            candidates.insert(ip);
+                            fingerprint_cache
+                                .borrow_mut()
+                                .insert(fingerprint, candidates);
+                        }
+                    }
                 }
                 ServiceEvent::ServiceRemoved(_, fullname) => {
                     // Best-effort: the fullname is "<instance>._lan-
@@ -325,4 +460,30 @@ fn start_browse(
             }
         }
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn persists_and_loads_last_success_candidates() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("lan-mouse-last-success-{nonce}.toml"));
+        let cache: FingerprintCache = Default::default();
+
+        persist_last_success_candidate(&path, " AA:BB ", "192.168.10.155".parse().unwrap())
+            .expect("persist candidate");
+        load_last_success_candidates(&cache, &path).expect("load candidates");
+
+        let loaded = cache.borrow();
+        let ips = loaded.get("aa:bb").expect("fingerprint cache entry");
+        assert!(ips.contains(&"192.168.10.155".parse().unwrap()));
+
+        let _ = fs::remove_file(path);
+    }
 }

@@ -1,18 +1,19 @@
 use crate::{
+    actions,
     capture::{Capture, CaptureType, ICaptureEvent},
     client::ClientManager,
     config::{Config, ConfigClient},
     connect::LanMouseConnection,
     crypto,
-    discovery::{Discovery, PrimaryCache},
+    discovery::{self, Discovery, FingerprintCache, PrimaryCache},
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
     listen::{LanMouseListener, ListenerCreationError},
 };
 use futures::StreamExt;
 use lan_mouse_ipc::{
-    AsyncFrontendListener, ClientHandle, FrontendEvent, FrontendRequest, IpcError,
-    IpcListenerCreationError, Position, Status,
+    ActionTrigger, AsyncFrontendListener, ClientAction, ClientHandle, FrontendEvent,
+    FrontendRequest, IpcError, IpcListenerCreationError, Position, Status,
 };
 use log;
 use std::{
@@ -35,6 +36,8 @@ pub enum ServiceError {
     ListenError(#[from] ListenerCreationError),
     #[error("failed to load certificate: `{0}`")]
     Certificate(#[from] crypto::Error),
+    #[error("health check failed: {0}")]
+    Health(String),
 }
 
 pub struct Service {
@@ -56,6 +59,9 @@ pub struct Service {
     port: u16,
     /// the public key fingerprint for (D)TLS
     public_key_fingerprint: String,
+    /// fingerprint-indexed address candidates learned from mDNS,
+    /// successful outgoing connections, and observed incoming peers.
+    fingerprint_cache: FingerprintCache,
     /// notify for pending frontend events
     frontend_event_pending: Notify,
     /// frontend events queued for sending
@@ -64,6 +70,10 @@ pub struct Service {
     capture_status: Status,
     /// status of input emulation (enabled / disabled)
     emulation_status: Status,
+    /// consecutive health ticks where capture was disabled
+    capture_recovery_attempts: u8,
+    /// consecutive health ticks where emulation was disabled
+    emulation_recovery_attempts: u8,
     /// keep track of registered connections to avoid duplicate barriers
     incoming_conns: HashSet<SocketAddr>,
     /// map from capture handle to connection info
@@ -105,8 +115,23 @@ impl Service {
         let listener =
             LanMouseListener::new(config.port(), cert.clone(), authorized_keys.clone()).await?;
         let primary_cache: PrimaryCache = Default::default();
-        let conn =
-            LanMouseConnection::new(cert.clone(), client_manager.clone(), primary_cache.clone());
+        let fingerprint_cache: FingerprintCache = Default::default();
+        let last_success_cache_path = config.last_success_cache_path();
+        if let Err(e) =
+            discovery::load_last_success_candidates(&fingerprint_cache, &last_success_cache_path)
+        {
+            log::warn!(
+                "failed to load last-success cache from {:?}: {e}",
+                last_success_cache_path
+            );
+        }
+        let conn = LanMouseConnection::new(
+            cert.clone(),
+            client_manager.clone(),
+            primary_cache.clone(),
+            fingerprint_cache.clone(),
+            Some(last_success_cache_path),
+        );
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
@@ -123,7 +148,13 @@ impl Service {
         let resolver = DnsResolver::new()?;
 
         let port = config.port();
-        let discovery = Discovery::new(port, config.mdns_discovery(), primary_cache);
+        let discovery = Discovery::new(
+            port,
+            config.mdns_discovery(),
+            primary_cache,
+            fingerprint_cache.clone(),
+            public_key_fingerprint.clone(),
+        );
         let service = Self {
             config,
             capture,
@@ -132,12 +163,15 @@ impl Service {
             resolver,
             authorized_keys,
             public_key_fingerprint,
+            fingerprint_cache,
             client_manager,
             frontend_event_pending: Default::default(),
             port,
             pending_frontend_events: Default::default(),
             capture_status: Default::default(),
             emulation_status: Default::default(),
+            capture_recovery_attempts: 0,
+            emulation_recovery_attempts: 0,
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
             next_trigger_handle: 0,
@@ -171,7 +205,13 @@ impl Service {
         // skip the immediate-fire of the first tick — Discovery
         // already published once at startup
         discovery_refresh_tick.tick().await;
+        let mut health_tick = tokio::time::interval(Duration::from_secs(60));
+        health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // skip the immediate-fire; startup events will establish the
+        // initial capture/emulation status first.
+        health_tick.tick().await;
 
+        let mut terminal_error = None;
         loop {
             tokio::select! {
                 request = self.frontend_listener.next() => self.handle_frontend_request(request),
@@ -181,7 +221,19 @@ impl Service {
                 event = self.resolver.event() => self.handle_resolver_event(event),
                 _ = self.config.changed() => self.handle_config_change(),
                 _ = discovery_refresh_tick.tick() => self.discovery.refresh(),
-                r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
+                _ = health_tick.tick() => {
+                    if let Err(e) = self.health_check() {
+                        log::error!("{e}");
+                        terminal_error = Some(e);
+                        break;
+                    }
+                },
+                r = signal::ctrl_c() => {
+                    if let Err(e) = r {
+                        terminal_error = Some(e.into());
+                    }
+                    break;
+                },
             }
         }
 
@@ -193,7 +245,11 @@ impl Service {
         log::debug!("terminating dns resolver ...");
         self.resolver.terminate().await;
 
-        Ok(())
+        if let Some(e) = terminal_error {
+            Err(e)
+        } else {
+            Ok(())
+        }
     }
 
     fn handle_frontend_request(&mut self, request: Option<Result<FrontendRequest, IpcError>>) {
@@ -228,6 +284,10 @@ impl Service {
             }
             FrontendRequest::UpdateHostname(handle, host) => {
                 self.update_hostname(handle, host);
+                self.save_config();
+            }
+            FrontendRequest::UpdatePeerFingerprint(handle, peer_fingerprint) => {
+                self.update_peer_fingerprint(handle, peer_fingerprint);
                 self.save_config();
             }
             FrontendRequest::UpdatePort(handle, port) => {
@@ -270,11 +330,13 @@ impl Service {
             .map(|(c, s)| ConfigClient {
                 ips: HashSet::from_iter(c.fix_ips),
                 hostname: c.hostname,
+                peer_fingerprint: c.peer_fingerprint,
                 port: c.port,
                 pos: c.pos,
                 active: s.active,
                 enter_hook: c.cmd,
                 leave_hook: c.cmd_leave,
+                actions: c.actions,
             })
             .collect();
         self.config.set_clients(clients);
@@ -328,6 +390,7 @@ impl Service {
                 pos,
                 fingerprint,
             } => {
+                self.remember_peer_addr(&fingerprint, addr);
                 // check if already registered
                 if !self.incoming_conns.contains(&addr) {
                     self.add_incoming(addr, pos, fingerprint.clone());
@@ -364,15 +427,23 @@ impl Service {
             }
             EmulationEvent::ReleaseNotify => self.capture.release_for_handover(),
             EmulationEvent::Connected { addr, fingerprint } => {
+                self.remember_peer_addr(&fingerprint, addr);
                 self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });
             }
-            EmulationEvent::PeerHello { addr, commit } => {
+            EmulationEvent::PeerHello {
+                addr,
+                fingerprint,
+                commit,
+            } => {
                 // Map the peer's source addr back to its client handle
-                // and stamp the commit. Skip if we don't have an
-                // outgoing client configured for this peer (incoming-
-                // only setup) — there's nowhere to display the version
-                // in that case anyway.
-                if let Some(handle) = self.client_manager.get_client(addr) {
+                // and stamp the commit. Fingerprint is preferred so
+                // `ips = []` clients still get matched after DHCP
+                // changes; addr fallback keeps legacy clients working.
+                let handle = fingerprint
+                    .as_deref()
+                    .and_then(|fp| self.client_manager.get_client_by_peer_fingerprint(fp))
+                    .or_else(|| self.client_manager.get_client(addr));
+                if let Some(handle) = handle {
                     self.client_manager.set_peer_commit(handle, Some(commit));
                     self.broadcast_client(handle);
                 }
@@ -446,6 +517,58 @@ impl Service {
         self.notify_frontend(FrontendEvent::MdnsDiscovery(self.config.mdns_discovery()));
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
+    }
+
+    fn health_check(&mut self) -> Result<(), ServiceError> {
+        const MAX_RECOVERY_ATTEMPTS: u8 = 3;
+        let active_clients = self.client_manager.active_clients().len();
+        let incoming = self.incoming_conns.len();
+        log::info!(
+            "health: capture={:?}, emulation={:?}, active_clients={active_clients}, \
+             incoming={incoming}, pending_frontend_events={pending}, \
+             capture_recovery_attempts={capture_attempts}, \
+             emulation_recovery_attempts={emulation_attempts}",
+            self.capture_status,
+            self.emulation_status,
+            pending = self.pending_frontend_events.len(),
+            capture_attempts = self.capture_recovery_attempts,
+            emulation_attempts = self.emulation_recovery_attempts,
+        );
+        if self.capture_status == Status::Disabled {
+            self.capture_recovery_attempts = self.capture_recovery_attempts.saturating_add(1);
+            log::warn!(
+                "health: capture disabled; requesting re-enable (attempt {}/{MAX_RECOVERY_ATTEMPTS})",
+                self.capture_recovery_attempts,
+            );
+            self.capture.reenable();
+            if self.capture_recovery_attempts >= MAX_RECOVERY_ATTEMPTS {
+                return Err(ServiceError::Health(format!(
+                    "capture backend stayed disabled after {MAX_RECOVERY_ATTEMPTS} recovery attempts"
+                )));
+            }
+        } else {
+            self.capture_recovery_attempts = 0;
+        }
+        if self.emulation_status == Status::Disabled {
+            self.emulation_recovery_attempts = self.emulation_recovery_attempts.saturating_add(1);
+            log::warn!(
+                "health: emulation disabled; requesting re-enable (attempt {}/{MAX_RECOVERY_ATTEMPTS})",
+                self.emulation_recovery_attempts,
+            );
+            self.emulation.reenable();
+            if self.emulation_recovery_attempts >= MAX_RECOVERY_ATTEMPTS {
+                return Err(ServiceError::Health(format!(
+                    "emulation backend stayed disabled after {MAX_RECOVERY_ATTEMPTS} recovery attempts"
+                )));
+            }
+        } else {
+            self.emulation_recovery_attempts = 0;
+        }
+        Ok(())
+    }
+
+    fn remember_peer_addr(&self, fingerprint: &str, addr: SocketAddr) {
+        discovery::insert_fingerprint_candidate(&self.fingerprint_cache, fingerprint, addr.ip());
     }
 
     const ENTER_HANDLE_BEGIN: u64 = u64::MAX / 2 + 1;
@@ -611,6 +734,16 @@ impl Service {
         self.broadcast_client(handle);
     }
 
+    fn update_peer_fingerprint(&mut self, handle: ClientHandle, peer_fingerprint: Option<String>) {
+        let peer_fingerprint = peer_fingerprint
+            .map(|fp| crypto::normalize_fingerprint(&fp))
+            .filter(|fp| !fp.is_empty());
+        log::info!("peer fingerprint changed: {peer_fingerprint:?}");
+        self.client_manager
+            .set_peer_fingerprint(handle, peer_fingerprint);
+        self.broadcast_client(handle);
+    }
+
     fn update_port(&mut self, handle: ClientHandle, port: u16) {
         self.client_manager.set_port(handle, port);
         self.broadcast_client(handle);
@@ -640,13 +773,29 @@ impl Service {
     }
 
     fn spawn_hook_command(&self, handle: ClientHandle, kind: HookKind) {
+        let actions = self
+            .client_manager
+            .get_actions(handle)
+            .into_iter()
+            .filter(|action| action_trigger(action) == kind.action_trigger())
+            .collect::<Vec<_>>();
         let cmd = match kind {
             HookKind::Enter => self.client_manager.get_enter_cmd(handle),
             HookKind::Leave => self.client_manager.get_leave_cmd(handle),
         };
-        let Some(cmd) = cmd else { return };
+        if actions.is_empty() && cmd.is_none() {
+            return;
+        }
         let label = kind.label();
         tokio::task::spawn_local(async move {
+            for action in actions {
+                log::info!("running {label} action: {action:?}");
+                match actions::run(action).await {
+                    Ok(()) => log::info!("{label} action completed successfully"),
+                    Err(e) => log::warn!("{label} action failed: {e}"),
+                }
+            }
+            let Some(cmd) = cmd else { return };
             log::info!("spawning {label} hook: {cmd}");
             #[cfg(windows)]
             let spawn_res = Command::new("cmd").arg("/C").arg(cmd.as_str()).spawn();
@@ -685,5 +834,18 @@ impl HookKind {
             HookKind::Enter => "enter",
             HookKind::Leave => "leave",
         }
+    }
+
+    fn action_trigger(self) -> ActionTrigger {
+        match self {
+            HookKind::Enter => ActionTrigger::Enter,
+            HookKind::Leave => ActionTrigger::Leave,
+        }
+    }
+}
+
+fn action_trigger(action: &ClientAction) -> ActionTrigger {
+    match action {
+        ClientAction::DdcVcp { on, .. } => *on,
     }
 }
