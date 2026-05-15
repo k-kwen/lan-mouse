@@ -218,6 +218,32 @@ impl CaptureTask {
             .2
     }
 
+    async fn ensure_connected_for_begin(&self, handle: CaptureHandle) -> bool {
+        const TIMEOUT: Duration = Duration::from_millis(1200);
+        const POLL: Duration = Duration::from_millis(25);
+
+        if self.conn.ensure_connected(handle).await {
+            return true;
+        }
+
+        log::info!("client {handle} is not connected yet; waiting for initial connection");
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(POLL) => {}
+                _ = self.cancellation_token.cancelled() => return false,
+            }
+
+            if self.conn.is_connected(handle).await {
+                return true;
+            }
+
+            if Instant::now() >= deadline {
+                return self.conn.is_connected(handle).await;
+            }
+        }
+    }
+
     async fn run(mut self) {
         loop {
             if let Err(e) = self.do_capture().await {
@@ -410,7 +436,8 @@ impl CaptureTask {
             return Ok(());
         }
 
-        if matches!(event, CaptureEvent::Begin { .. }) && !self.conn.ensure_connected(handle).await
+        if matches!(event, CaptureEvent::Begin { .. })
+            && !self.ensure_connected_for_begin(handle).await
         {
             log::info!("releasing capture: client {handle} is not connected yet");
             capture.release().await?;
