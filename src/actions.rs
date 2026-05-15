@@ -1,5 +1,5 @@
 use clap::Args;
-use lan_mouse_ipc::ClientAction;
+use lan_mouse_ipc::{ActionTrigger, ClientAction};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -22,6 +22,16 @@ pub(crate) async fn run(action: ClientAction) -> Result<(), ActionError> {
             ..
         } => tokio::task::spawn_blocking(move || platform::set_vcp(monitor, code, value)).await?,
     }
+}
+
+pub(crate) fn is_fast_enter_prefire_supported(action: &ClientAction) -> bool {
+    matches!(
+        action,
+        ClientAction::DdcVcp {
+            on: ActionTrigger::Enter,
+            ..
+        }
+    ) && platform::supports_ddc_vcp()
 }
 
 #[derive(Args, Clone, Debug, Eq, PartialEq)]
@@ -290,6 +300,10 @@ mod platform {
             }
         }
     }
+
+    pub(super) fn supports_ddc_vcp() -> bool {
+        true
+    }
 }
 
 #[cfg(not(windows))]
@@ -302,5 +316,9 @@ mod platform {
         _value: u32,
     ) -> Result<(), ActionError> {
         Err(ActionError::Unsupported)
+    }
+
+    pub(super) fn supports_ddc_vcp() -> bool {
+        false
     }
 }

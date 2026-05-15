@@ -78,6 +78,11 @@ pub struct Service {
     incoming_conns: HashSet<SocketAddr>,
     /// map from capture handle to connection info
     incoming_conn_info: HashMap<ClientHandle, Incoming>,
+    /// Default-client handles whose enter DDC action was already
+    /// started on CaptureBegin because the peer was ready. The ACK
+    /// path skips native DDC for these handles but still runs hooks
+    /// and any non-prefired future actions.
+    prefired_enter_ddc: HashSet<ClientHandle>,
     next_trigger_handle: u64,
     /// mDNS-SD service registration + browse. Advertises our primary
     /// interface IP for peer dialers to bias toward; populates
@@ -174,6 +179,7 @@ impl Service {
             emulation_recovery_attempts: 0,
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
+            prefired_enter_ddc: Default::default(),
             next_trigger_handle: 0,
             discovery,
         };
@@ -467,6 +473,8 @@ impl Service {
                 // => notify it that its capture should be released
                 if let Some(incoming) = self.incoming_conn_info.get(&handle) {
                     self.emulation.send_leave_event(incoming.addr);
+                } else {
+                    self.prefire_enter_ddc_if_ready(handle);
                 }
             }
             ICaptureEvent::CaptureDisabled => {
@@ -479,10 +487,12 @@ impl Service {
             }
             ICaptureEvent::ClientEntered(handle) => {
                 log::info!("entering client {handle} ...");
-                self.spawn_hook_command(handle, HookKind::Enter);
+                let skip_prefired_ddc = self.prefired_enter_ddc.remove(&handle);
+                self.spawn_hook_command(handle, HookKind::Enter, skip_prefired_ddc);
             }
             ICaptureEvent::ClientLeft(handle) => {
-                self.spawn_hook_command(handle, HookKind::Leave);
+                self.prefired_enter_ddc.remove(&handle);
+                self.spawn_hook_command(handle, HookKind::Leave, false);
             }
         }
     }
@@ -791,12 +801,38 @@ impl Service {
         self.notify_frontend(event);
     }
 
-    fn spawn_hook_command(&self, handle: ClientHandle, kind: HookKind) {
+    fn client_ready_for_prefire(&self, handle: ClientHandle) -> bool {
+        self.client_manager.active_addr(handle).is_some() && self.client_manager.alive(handle)
+    }
+
+    fn prefire_enter_ddc_if_ready(&mut self, handle: ClientHandle) {
+        self.prefired_enter_ddc.remove(&handle);
+        if !self.client_ready_for_prefire(handle) {
+            return;
+        }
+        let actions = self
+            .client_manager
+            .get_actions(handle)
+            .into_iter()
+            .filter(actions::is_fast_enter_prefire_supported)
+            .collect::<Vec<_>>();
+        if actions.is_empty() {
+            return;
+        }
+        self.prefired_enter_ddc.insert(handle);
+        log::info!("prefiring enter DDC for ready client {handle}");
+        Self::spawn_actions(actions, "prefire enter");
+    }
+
+    fn spawn_hook_command(&self, handle: ClientHandle, kind: HookKind, skip_prefired_ddc: bool) {
         let actions = self
             .client_manager
             .get_actions(handle)
             .into_iter()
             .filter(|action| action_trigger(action) == kind.action_trigger())
+            .filter(|action| {
+                !(skip_prefired_ddc && actions::is_fast_enter_prefire_supported(action))
+            })
             .collect::<Vec<_>>();
         let cmd = match kind {
             HookKind::Enter => self.client_manager.get_enter_cmd(handle),
@@ -806,6 +842,26 @@ impl Service {
             return;
         }
         let label = kind.label();
+        Self::spawn_actions_and_hook(actions, cmd, label);
+    }
+
+    fn spawn_actions(actions: Vec<ClientAction>, label: &'static str) {
+        tokio::task::spawn_local(async move {
+            for action in actions {
+                log::info!("running {label} action: {action:?}");
+                match actions::run(action).await {
+                    Ok(()) => log::info!("{label} action completed successfully"),
+                    Err(e) => log::warn!("{label} action failed: {e}"),
+                }
+            }
+        });
+    }
+
+    fn spawn_actions_and_hook(
+        actions: Vec<ClientAction>,
+        cmd: Option<String>,
+        label: &'static str,
+    ) {
         tokio::task::spawn_local(async move {
             for action in actions {
                 log::info!("running {label} action: {action:?}");
