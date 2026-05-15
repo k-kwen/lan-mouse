@@ -352,6 +352,10 @@ impl LanMouseConnection {
         self.conn_for_handle(handle).await.is_some()
     }
 
+    pub(crate) async fn is_ready(&self, handle: ClientHandle) -> bool {
+        self.conn_for_handle(handle).await.is_some() && self.client_manager.alive(handle)
+    }
+
     pub(crate) async fn ensure_connected(&self, handle: ClientHandle) -> bool {
         if self.is_connected(handle).await {
             return true;

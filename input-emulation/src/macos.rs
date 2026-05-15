@@ -848,6 +848,19 @@ fn get_display_bounds(display: CGDirectDisplayID) -> (CGFloat, CGFloat, CGFloat,
     }
 }
 
+fn valid_display_bounds(
+    display: CGDirectDisplayID,
+) -> Option<(CGFloat, CGFloat, CGFloat, CGFloat)> {
+    let (min_x, min_y, max_x, max_y) = get_display_bounds(display);
+    if max_x <= min_x || max_y <= min_y {
+        log::warn!(
+            "ignoring invalid display bounds for display {display}: ({min_x}, {min_y})-({max_x}, {max_y})"
+        );
+        return None;
+    }
+    Some((min_x, min_y, max_x, max_y))
+}
+
 fn clamp_to_screen_space(
     current_x: CGFloat,
     current_y: CGFloat,
@@ -873,7 +886,11 @@ fn clamp_to_screen_space(
     let new_y = current_y + dy;
 
     let final_display = get_display_at_point(new_x, new_y).unwrap_or(current_display);
-    let (min_x, min_y, max_x, max_y) = get_display_bounds(final_display);
+    let Some((min_x, min_y, max_x, max_y)) =
+        valid_display_bounds(final_display).or_else(|| valid_display_bounds(current_display))
+    else {
+        return (current_x, current_y);
+    };
 
     (
         new_x.clamp(min_x, max_x - 1.),
