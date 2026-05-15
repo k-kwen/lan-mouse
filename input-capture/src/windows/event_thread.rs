@@ -364,7 +364,10 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
 
     /* notify mainthread (drop events if sending too fast) */
     if let Err(e) = try_send_event(pos, CaptureEvent::Input(Event::Pointer(pointer_event))) {
-        log::warn!("e: {e}");
+        match e {
+            TrySendError::Full(_) => log::debug!("dropping pointer event: capture queue full"),
+            TrySendError::Closed(_) => log::warn!("dropping pointer event: capture queue closed"),
+        }
     }
 
     /* don't pass event to applications */

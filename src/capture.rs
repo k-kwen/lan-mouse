@@ -202,20 +202,11 @@ impl CaptureTask {
             .any(|&(_, p, t)| p == pos && t == CaptureType::Default)
     }
 
-    fn get_pos(&self, handle: CaptureHandle) -> Position {
+    fn get_capture(&self, handle: CaptureHandle) -> Option<(Position, CaptureType)> {
         self.captures
             .iter()
             .find(|(h, ..)| *h == handle)
-            .expect("no such capture")
-            .1
-    }
-
-    fn get_type(&self, handle: CaptureHandle) -> CaptureType {
-        self.captures
-            .iter()
-            .find(|(h, ..)| *h == handle)
-            .expect("no such capture")
-            .2
+            .map(|(_, pos, capture_type)| (*pos, *capture_type))
     }
 
     async fn run(mut self) {
@@ -334,8 +325,11 @@ impl CaptureTask {
                         // so the wall-press model has a real upper
                         // clamp on virtual_pos for this position.
                         ProtoEvent::Bounds { width, height } => {
-                            let pos = self.get_pos(handle);
-                            capture.set_peer_bounds(pos, width, height);
+                            if let Some((pos, _)) = self.get_capture(handle) {
+                                capture.set_peer_bounds(pos, width, height);
+                            } else {
+                                log::debug!("ignoring Bounds from removed capture {handle}");
+                            }
                         }
                         _ => {}
                     }
@@ -348,13 +342,16 @@ impl CaptureTask {
                         capture.create(h, p).await?;
                     }
                     CaptureRequest::Destroy(h) => {
-                        let pos = self.get_pos(h);
-                        self.remove_capture(h);
-                        capture.destroy(h).await?;
-                        // Drop the cached geometry — the next client
-                        // added at this position may report different
-                        // bounds.
-                        capture.clear_peer_bounds(pos);
+                        if let Some((pos, _)) = self.get_capture(h) {
+                            self.remove_capture(h);
+                            capture.destroy(h).await?;
+                            // Drop the cached geometry — the next client
+                            // added at this position may report different
+                            // bounds.
+                            capture.clear_peer_bounds(pos);
+                        } else {
+                            log::debug!("ignoring destroy for removed capture {h}");
+                        }
                     }
                     CaptureRequest::SetReleaseBind(bind) => {
                         self.release_bind.borrow_mut().clone_from(&bind);
@@ -378,6 +375,11 @@ impl CaptureTask {
         let (handle, event) = event;
         log::trace!("({handle}): {event:?}");
 
+        let Some((capture_pos, capture_type)) = self.get_capture(handle) else {
+            log::debug!("ignoring event for removed capture {handle}: {event:?}");
+            return Ok(());
+        };
+
         if capture.keys_pressed(&self.release_bind.borrow()) {
             log::info!("releasing capture: release-bind pressed");
             return self.release_capture(capture).await;
@@ -399,10 +401,10 @@ impl CaptureTask {
         }
 
         // enter only capture (for incoming connections)
-        if self.get_type(handle) == CaptureType::EnterOnly {
+        if capture_type == CaptureType::EnterOnly {
             // if there is no active outgoing connection at the current capture,
             // we release the capture
-            if !self.is_default_capture_at(self.get_pos(handle)) {
+            if !self.is_default_capture_at(capture_pos) {
                 log::info!("releasing capture: no active client at this position");
                 capture.release().await?;
             }
@@ -426,7 +428,7 @@ impl CaptureTask {
                 .expect("channel closed");
         }
 
-        let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
+        let opposite_pos = to_proto_pos(capture_pos.opposite());
 
         // If we're starting a fresh capture and the backend reported
         // a cursor position at the moment of crossing, send a
@@ -440,9 +442,8 @@ impl CaptureTask {
             cursor: Some(cursor),
         } = event
         {
-            let pos = self.get_pos(handle);
             capture.host_normalized_cursor(cursor).map(|(nx, ny)| {
-                let proto_pos = to_proto_pos(pos.opposite());
+                let proto_pos = to_proto_pos(capture_pos.opposite());
                 (proto_pos, nx, ny)
             })
         } else {
