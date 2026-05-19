@@ -174,6 +174,7 @@ extern "C" {
 // synthetic input-source shortcuts (e.g. Ctrl+Space, F18) coming from
 // CGEventPost, so we toggle the input source programmatically instead.
 type TISInputSourceRef = *const c_void;
+type CFBooleanRef = *const c_void;
 type CFStringRef = *const c_void;
 type CFArrayRef = *const c_void;
 type CFIndex = isize;
@@ -207,6 +208,8 @@ struct TisApi {
     get_property: FnTisGetProperty,
     select: FnTisSelect,
     property_input_source_id: CFStringRef,
+    property_input_source_languages: CFStringRef,
+    property_input_source_is_select_capable: CFStringRef,
 }
 
 unsafe impl Send for TisApi {}
@@ -246,19 +249,28 @@ fn tis_api() -> Option<&'static TisApi> {
         let get_property = dlsym(lookup_handle, c"TISGetInputSourceProperty".as_ptr());
         let select = dlsym(lookup_handle, c"TISSelectInputSource".as_ptr());
         let id_var = dlsym(lookup_handle, c"kTISPropertyInputSourceID".as_ptr());
+        let languages_var = dlsym(lookup_handle, c"kTISPropertyInputSourceLanguages".as_ptr());
+        let selectable_var = dlsym(
+            lookup_handle,
+            c"kTISPropertyInputSourceIsSelectCapable".as_ptr(),
+        );
 
         if copy_current.is_null()
             || copy_for_lang.is_null()
             || get_property.is_null()
             || select.is_null()
             || id_var.is_null()
+            || languages_var.is_null()
+            || selectable_var.is_null()
         {
             log::warn!("TIS: required symbols missing; IME toggle disabled");
             return None;
         }
 
-        // id_var is a pointer to the static CFStringRef variable.
+        // These vars are pointers to static CFStringRef variables.
         let property_input_source_id = *(id_var as *const CFStringRef);
+        let property_input_source_languages = *(languages_var as *const CFStringRef);
+        let property_input_source_is_select_capable = *(selectable_var as *const CFStringRef);
 
         Some(TisApi {
             copy_current: std::mem::transmute::<*mut c_void, FnTisCopyCurrent>(copy_current),
@@ -275,6 +287,8 @@ fn tis_api() -> Option<&'static TisApi> {
             get_property: std::mem::transmute::<*mut c_void, FnTisGetProperty>(get_property),
             select: std::mem::transmute::<*mut c_void, FnTisSelect>(select),
             property_input_source_id,
+            property_input_source_languages,
+            property_input_source_is_select_capable,
         })
     })
     .as_ref()
@@ -283,6 +297,7 @@ fn tis_api() -> Option<&'static TisApi> {
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     fn CFRelease(cf: *const c_void);
+    fn CFBooleanGetValue(boolean: CFBooleanRef) -> bool;
     fn CFStringGetCString(s: CFStringRef, buf: *mut u8, len: CFIndex, encoding: u32) -> bool;
     fn CFStringCreateWithCString(
         alloc: *const c_void,
@@ -856,15 +871,11 @@ fn cfstring_from(s: &str) -> CFStringRef {
     }
 }
 
-fn input_source_id(api: &TisApi, source: TISInputSourceRef) -> Option<String> {
+fn cfstring_to_string(s: CFStringRef) -> Option<String> {
     unsafe {
-        let id_ref = (api.get_property)(source, api.property_input_source_id);
-        if id_ref.is_null() {
-            return None;
-        }
         let mut buf = [0u8; 256];
         if !CFStringGetCString(
-            id_ref as CFStringRef,
+            s,
             buf.as_mut_ptr(),
             buf.len() as CFIndex,
             K_CF_STRING_ENCODING_UTF8,
@@ -876,13 +887,51 @@ fn input_source_id(api: &TisApi, source: TISInputSourceRef) -> Option<String> {
     }
 }
 
+fn input_source_id(api: &TisApi, source: TISInputSourceRef) -> Option<String> {
+    unsafe {
+        let id_ref = (api.get_property)(source, api.property_input_source_id);
+        if id_ref.is_null() {
+            return None;
+        }
+        cfstring_to_string(id_ref as CFStringRef)
+    }
+}
+
+fn input_source_has_language(api: &TisApi, source: TISInputSourceRef, language: &str) -> bool {
+    unsafe {
+        let languages_ref = (api.get_property)(source, api.property_input_source_languages);
+        if languages_ref.is_null() {
+            return false;
+        }
+        let languages = languages_ref as CFArrayRef;
+        let count = CFArrayGetCount(languages);
+        for i in 0..count {
+            let lang_ref = CFArrayGetValueAtIndex(languages, i) as CFStringRef;
+            if lang_ref.is_null() {
+                continue;
+            }
+            if cfstring_to_string(lang_ref).as_deref() == Some(language) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn input_source_is_selectable(api: &TisApi, source: TISInputSourceRef) -> bool {
+    unsafe {
+        let selectable_ref =
+            (api.get_property)(source, api.property_input_source_is_select_capable);
+        !selectable_ref.is_null() && CFBooleanGetValue(selectable_ref as CFBooleanRef)
+    }
+}
+
 /// Toggle between a Korean input source and a roman keyboard layout.
-/// Inspects the currently selected source's ID; if Korean, switches to en
-/// via TISCopyInputSourceForLanguage. Korean direction requires a selectable
-/// *input mode* (e.g. com.apple.inputmethod.Korean.2SetKorean), which is only
-/// reachable through the enabled-source list — TISCopyInputSourceForLanguage
-/// returns the parent input *method* (com.apple.inputmethod.Korean) and
-/// TISSelectInputSource rejects it with paramErr.
+/// Inspects the currently selected source's language list; if it supports
+/// Korean, switches to en via TISCopyInputSourceForLanguage. Korean direction
+/// walks the enabled-source list and selects a source that declares `ko` and is
+/// select-capable. This covers both Apple's input modes and third-party input
+/// methods without modes.
 fn toggle_korean_input_source() {
     let Some(api) = tis_api() else {
         log::warn!("TIS: API unavailable");
@@ -894,10 +943,10 @@ fn toggle_korean_input_source() {
             log::warn!("TIS: failed to get current input source");
             return;
         }
-        let current_id = input_source_id(api, current).unwrap_or_default();
+        let current_is_korean = input_source_has_language(api, current, "ko");
         CFRelease(current);
 
-        let want_korean = !current_id.contains("Korean");
+        let want_korean = !current_is_korean;
 
         if !want_korean {
             // English direction: language lookup returns the keyboard layout
@@ -925,8 +974,7 @@ fn toggle_korean_input_source() {
         }
 
         // Korean direction: walk the enabled input-source list and pick the
-        // first source whose ID contains "Korean" (this is the input mode,
-        // not the parent method).
+        // first selectable source that declares Korean support.
         let Some(create_list) = api.create_list else {
             log::warn!("TIS: input-source list unavailable; cannot select Korean");
             return;
@@ -940,14 +988,10 @@ fn toggle_korean_input_source() {
         let mut selected = false;
         for i in 0..count {
             let source = CFArrayGetValueAtIndex(list, i) as TISInputSourceRef;
-            let id = match input_source_id(api, source) {
-                Some(s) => s,
-                None => continue,
-            };
-            // Korean input modes have an extra dotted suffix
-            // (e.g. com.apple.inputmethod.Korean.2SetKorean). The bare
-            // bundle id is not selectable.
-            if id.contains("Korean") && id.matches('.').count() > 3 {
+            if input_source_has_language(api, source, "ko")
+                && input_source_is_selectable(api, source)
+            {
+                let id = input_source_id(api, source).unwrap_or_else(|| "<unknown>".to_string());
                 let status = (api.select)(source);
                 if status == 0 {
                     log::info!("TIS: switched to {id}");
