@@ -33,15 +33,6 @@ function Escape-BatchString {
     $Value.Replace("%", "%%")
 }
 
-function Quote-TaskArgument {
-    param([Parameter(Mandatory = $true)][string] $Value)
-    if ($Value -match '[\s"]') {
-        '"' + ($Value -replace '"', '\"') + '"'
-    } else {
-        $Value
-    }
-}
-
 function Require-File {
     param([Parameter(Mandatory = $true)][string] $Path)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
@@ -133,14 +124,21 @@ if ($PSCmdlet.ShouldProcess($InstallDir, "Install lan-mouse headless runtime")) 
         throw "lan-mouse pair failed with exit code $LASTEXITCODE"
     }
 
-    Remove-Item -LiteralPath $DaemonBat -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $LauncherVbs -Force -ErrorAction SilentlyContinue
+    @(
+        "@echo off",
+        "setlocal",
+        ('"{0}" --log-file "{1}" --log-level info run' -f (Escape-BatchString $ExeDest), (Escape-BatchString $LogPath))
+    ) | Set-Content -LiteralPath $DaemonBat -Encoding ASCII
 
-    $RunArgsList = @("--log-file", $LogPath, "--log-level", "info", "run")
-    $RunArgs = ($RunArgsList | ForEach-Object { Quote-TaskArgument $_ }) -join " "
+    @(
+        'Set shell = CreateObject("WScript.Shell")',
+        'If WScript.Arguments.Count = 0 Then WScript.Quit 1',
+        'shell.Run """" & WScript.Arguments(0) & """", 0, True'
+    ) | Set-Content -LiteralPath $LauncherVbs -Encoding ASCII
 
+    $ActionArgs = ('"{0}" "{1}"' -f $LauncherVbs, $DaemonBat)
     if (-not $NoTask) {
-        $Action = New-ScheduledTaskAction -Execute $ExeDest -Argument $RunArgs
+        $Action = New-ScheduledTaskAction -Execute "$env:WINDIR\System32\wscript.exe" -Argument $ActionArgs
         $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
         $Settings = New-ScheduledTaskSettingsSet `
             -AllowStartIfOnBatteries `
@@ -163,7 +161,7 @@ if ($PSCmdlet.ShouldProcess($InstallDir, "Install lan-mouse headless runtime")) 
             Start-Sleep -Seconds 2
         }
     } elseif (-not $NoStart) {
-        Start-Process -FilePath $ExeDest -ArgumentList $RunArgsList -WindowStyle Hidden
+        Start-Process -FilePath "$env:WINDIR\System32\wscript.exe" -ArgumentList $ActionArgs -WindowStyle Hidden
         Start-Sleep -Seconds 2
     }
 
