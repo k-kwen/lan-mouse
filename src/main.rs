@@ -1,4 +1,3 @@
-use env_logger::Env;
 use input_capture::InputCaptureError;
 use input_emulation::InputEmulationError;
 use lan_mouse::{
@@ -16,6 +15,8 @@ use std::process::Child;
 use std::{future::Future, io, process};
 use thiserror::Error;
 use tokio::task::LocalSet;
+
+mod logging;
 
 #[derive(Debug, Error)]
 enum LanMouseError {
@@ -40,8 +41,10 @@ enum LanMouseError {
 
 fn main() {
     // init logging
-    let env = Env::default().filter_or("LAN_MOUSE_LOG_LEVEL", "info");
-    env_logger::init_from_env(env);
+    if let Err(e) = logging::init() {
+        eprintln!("failed to initialize logging: {e}");
+        process::exit(1);
+    }
 
     if let Err(e) = run() {
         log::error!("{e}");

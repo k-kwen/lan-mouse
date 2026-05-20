@@ -107,9 +107,7 @@ impl InputCaptureState {
                 // the existing modifier-sync logic emits a Modifiers event on
                 // the first post-capture motion so the peer sees ⌘ pressed.
                 if !event.get_flags().contains(CGEventFlags::CGEventFlagCommand) {
-                    log::trace!(
-                        "Crossed barrier into {position:?} but ⌘ not held — guarded"
-                    );
+                    log::trace!("Crossed barrier into {position:?} but ⌘ not held — guarded");
                     return None;
                 }
                 log::debug!("Crossed barrier into position: {position:?} (⌘ held)");

@@ -28,6 +28,7 @@ use super::error::MacOSEmulationCreationError;
 const DEFAULT_REPEAT_DELAY: Duration = Duration::from_millis(500);
 const DEFAULT_REPEAT_INTERVAL: Duration = Duration::from_millis(32);
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
+const IME_TOGGLE_DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// Per-axis scale applied to incoming pointer motion deltas before they
 /// are turned into mouse-move events. macOS's `mouse.scaling` preference
@@ -55,6 +56,8 @@ pub(crate) struct MacOSEmulation {
     button_click_state: i64,
     /// current modifier state
     modifier_state: Rc<Cell<XMods>>,
+    /// last accepted remote IME toggle time
+    last_ime_toggle: Option<Instant>,
     /// notify to cancel key repeats
     notify_repeat_task: Arc<Notify>,
 }
@@ -87,6 +90,7 @@ impl MacOSEmulation {
             repeat_task: None,
             notify_repeat_task: Arc::new(Notify::new()),
             modifier_state: Rc::new(Cell::new(XMods::empty())),
+            last_ime_toggle: None,
         })
     }
 
@@ -124,6 +128,19 @@ impl MacOSEmulation {
             key_event(event_source.clone(), key, 0, modifiers.get());
         });
         self.repeat_task = Some(repeat_task);
+    }
+
+    fn accept_ime_toggle(&mut self) -> bool {
+        let now = Instant::now();
+        if self
+            .last_ime_toggle
+            .is_some_and(|last| now.duration_since(last) < IME_TOGGLE_DEBOUNCE)
+        {
+            log::debug!("Right Alt -> Korean IME toggle ignored by debounce");
+            return false;
+        }
+        self.last_ime_toggle = Some(now);
+        true
     }
 
     async fn cancel_repeat_task(&mut self) {
@@ -583,16 +600,14 @@ struct AppleScriptApi {
 unsafe impl Send for AppleScriptApi {}
 unsafe impl Sync for AppleScriptApi {}
 
-static APPLESCRIPT_API: std::sync::OnceLock<Option<AppleScriptApi>> =
-    std::sync::OnceLock::new();
+static APPLESCRIPT_API: std::sync::OnceLock<Option<AppleScriptApi>> = std::sync::OnceLock::new();
 
 fn applescript_api() -> Option<&'static AppleScriptApi> {
     APPLESCRIPT_API
         .get_or_init(|| unsafe {
             // Pull in Foundation so NSAppleScript is in dyld. Failure is
             // tolerated — Foundation is usually loaded transitively.
-            let foundation_path =
-                c"/System/Library/Frameworks/Foundation.framework/Foundation";
+            let foundation_path = c"/System/Library/Frameworks/Foundation.framework/Foundation";
             let _foundation = dlopen(foundation_path.as_ptr(), RTLD_LAZY);
 
             let get_class = dlsym(RTLD_DEFAULT, c"objc_getClass".as_ptr());
@@ -611,9 +626,7 @@ fn applescript_api() -> Option<&'static AppleScriptApi> {
             let nsapplescript_class = get_class(c"NSAppleScript".as_ptr());
             let nsautoreleasepool_class = get_class(c"NSAutoreleasePool".as_ptr());
             if nsapplescript_class.is_null() || nsautoreleasepool_class.is_null() {
-                log::warn!(
-                    "NSAppleScript: required classes not found; subprocess fallback only"
-                );
+                log::warn!("NSAppleScript: required classes not found; subprocess fallback only");
                 return None;
             }
             Some(AppleScriptApi {
@@ -837,8 +850,7 @@ fn run_apple_script_in_process(source: &str) -> bool {
             CFRelease(ns_string);
             return false;
         }
-        let script =
-            (api.msg_send_1)(script_alloc, api.init_with_source_sel, ns_string as ObjcId);
+        let script = (api.msg_send_1)(script_alloc, api.init_with_source_sel, ns_string as ObjcId);
         if script.is_null() {
             if !pool.is_null() {
                 let _ = (api.msg_send_0)(pool, api.drain_sel);
@@ -1371,7 +1383,7 @@ impl Emulation for MacOSEmulation {
                     let remap_to_ime_toggle = key == 100;
                     if remap_to_ime_toggle {
                         log::debug!("Right Alt -> Korean IME toggle (state={state})");
-                        if state == 1 {
+                        if state == 1 && self.accept_ime_toggle() {
                             toggle_korean_input_source();
                         }
                         return Ok(());

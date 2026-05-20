@@ -11,6 +11,7 @@ SOURCE_BIN="${SOURCE_BIN:-}"
 DO_SIGN=1
 DO_START=1
 OPEN_PRIVACY=1
+LOG_LEVEL="${LAN_MOUSE_LOG_LEVEL:-info}"
 
 usage() {
   cat <<'USAGE'
@@ -25,6 +26,7 @@ Options:
   --no-sign              skip codesign
   --no-start             write LaunchAgent but do not start it
   --no-open-privacy      print permission steps without opening Settings
+  --log-level LEVEL      daemon log level (default: LAN_MOUSE_LOG_LEVEL or info)
   -h, --help             show this help
 USAGE
 }
@@ -62,6 +64,10 @@ while [ "$#" -gt 0 ]; do
     --no-open-privacy)
       OPEN_PRIVACY=0
       shift
+      ;;
+    --log-level)
+      LOG_LEVEL="${2:?missing value for --log-level}"
+      shift 2
       ;;
     -h|--help)
       usage
@@ -152,6 +158,9 @@ ESC_LABEL="$(printf '%s' "$LABEL" | xml_escape)"
 ESC_BIN="$(printf '%s' "$INSTALL_BIN" | xml_escape)"
 ESC_STDOUT="$(printf '%s' "$LOG_DIR/daemon.stdout.log" | xml_escape)"
 ESC_STDERR="$(printf '%s' "$LOG_DIR/daemon.stderr.log" | xml_escape)"
+ESC_LOG_FILE="$(printf '%s' "$LOG_DIR/daemon.log" | xml_escape)"
+ESC_LOG_LEVEL="$(printf '%s' "$LOG_LEVEL" | xml_escape)"
+touch "$LOG_DIR/daemon.log" "$LOG_DIR/daemon.stdout.log" "$LOG_DIR/daemon.stderr.log"
 
 cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -166,6 +175,13 @@ cat > "$PLIST" <<EOF
     <string>$ESC_BIN</string>
     <string>daemon</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>LAN_MOUSE_LOG_FILE</key>
+    <string>$ESC_LOG_FILE</string>
+    <key>LAN_MOUSE_LOG_LEVEL</key>
+    <string>$ESC_LOG_LEVEL</string>
+  </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
@@ -216,6 +232,7 @@ Config is preserved at:
   $HOME/.config/lan-mouse/config.toml
 
 Logs:
+  $LOG_DIR/daemon.log
   $LOG_DIR/daemon.stderr.log
 EOF
 

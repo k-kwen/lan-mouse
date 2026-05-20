@@ -9,6 +9,7 @@ The installer:
 - signs the copied binary with `Lan-mouse Dev Cert` when available
 - falls back to ad-hoc signing when the certificate is missing
 - writes `~/Library/LaunchAgents/com.<user>.lan-mouse.plist`
+- writes daemon logs to `~/Library/Logs/lan-mouse/daemon.log`
 - starts the daemon automatically
 - opens the macOS Privacy panes and prints the permission steps
 
@@ -29,6 +30,7 @@ Useful options:
 ./install-headless.sh --source ./lan-mouse
 ./install-headless.sh --install-dir "$HOME/Tools/lan-mouse"
 ./install-headless.sh --label "com.kwenpa.lan-mouse"
+./install-headless.sh --log-level debug
 ./install-headless.sh --no-open-privacy
 ```
 
@@ -42,6 +44,18 @@ Then restart the daemon:
 ```sh
 launchctl kickstart -k "gui/$(id -u)/com.$USER.lan-mouse"
 ```
+
+## Logs
+
+The LaunchAgent sets `LAN_MOUSE_LOG_FILE` and `LAN_MOUSE_LOG_LEVEL`, so daemon
+logs are written directly by the process:
+
+```sh
+tail -f "$HOME/Library/Logs/lan-mouse/daemon.log"
+```
+
+The stdout/stderr files remain available for startup failures before logging is
+initialized.
 
 ## Uninstall
 
