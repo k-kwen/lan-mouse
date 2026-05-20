@@ -28,6 +28,7 @@ use super::error::MacOSEmulationCreationError;
 const DEFAULT_REPEAT_DELAY: Duration = Duration::from_millis(500);
 const DEFAULT_REPEAT_INTERVAL: Duration = Duration::from_millis(32);
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
+const IME_TOGGLE_DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// Per-axis scale applied to incoming pointer motion deltas before they
 /// are turned into mouse-move events. macOS's `mouse.scaling` preference
@@ -55,6 +56,8 @@ pub(crate) struct MacOSEmulation {
     button_click_state: i64,
     /// current modifier state
     modifier_state: Rc<Cell<XMods>>,
+    /// last accepted remote IME toggle time
+    last_ime_toggle: Option<Instant>,
     /// notify to cancel key repeats
     notify_repeat_task: Arc<Notify>,
 }
@@ -87,6 +90,7 @@ impl MacOSEmulation {
             repeat_task: None,
             notify_repeat_task: Arc::new(Notify::new()),
             modifier_state: Rc::new(Cell::new(XMods::empty())),
+            last_ime_toggle: None,
         })
     }
 
@@ -124,6 +128,19 @@ impl MacOSEmulation {
             key_event(event_source.clone(), key, 0, modifiers.get());
         });
         self.repeat_task = Some(repeat_task);
+    }
+
+    fn accept_ime_toggle(&mut self) -> bool {
+        let now = Instant::now();
+        if self
+            .last_ime_toggle
+            .is_some_and(|last| now.duration_since(last) < IME_TOGGLE_DEBOUNCE)
+        {
+            log::debug!("Right Alt -> Korean IME toggle ignored by debounce");
+            return false;
+        }
+        self.last_ime_toggle = Some(now);
+        true
     }
 
     async fn cancel_repeat_task(&mut self) {
@@ -168,12 +185,14 @@ extern "C" {
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     fn AXIsProcessTrusted() -> bool;
+    fn CGEventPost(tap: u32, event: *const c_void);
 }
 
 // Text Input Source (TIS) bindings for direct IME switching. macOS rejects
 // synthetic input-source shortcuts (e.g. Ctrl+Space, F18) coming from
 // CGEventPost, so we toggle the input source programmatically instead.
 type TISInputSourceRef = *const c_void;
+type CFBooleanRef = *const c_void;
 type CFStringRef = *const c_void;
 type CFArrayRef = *const c_void;
 type CFIndex = isize;
@@ -207,6 +226,8 @@ struct TisApi {
     get_property: FnTisGetProperty,
     select: FnTisSelect,
     property_input_source_id: CFStringRef,
+    property_input_source_languages: CFStringRef,
+    property_input_source_is_select_capable: CFStringRef,
 }
 
 unsafe impl Send for TisApi {}
@@ -246,19 +267,28 @@ fn tis_api() -> Option<&'static TisApi> {
         let get_property = dlsym(lookup_handle, c"TISGetInputSourceProperty".as_ptr());
         let select = dlsym(lookup_handle, c"TISSelectInputSource".as_ptr());
         let id_var = dlsym(lookup_handle, c"kTISPropertyInputSourceID".as_ptr());
+        let languages_var = dlsym(lookup_handle, c"kTISPropertyInputSourceLanguages".as_ptr());
+        let selectable_var = dlsym(
+            lookup_handle,
+            c"kTISPropertyInputSourceIsSelectCapable".as_ptr(),
+        );
 
         if copy_current.is_null()
             || copy_for_lang.is_null()
             || get_property.is_null()
             || select.is_null()
             || id_var.is_null()
+            || languages_var.is_null()
+            || selectable_var.is_null()
         {
             log::warn!("TIS: required symbols missing; IME toggle disabled");
             return None;
         }
 
-        // id_var is a pointer to the static CFStringRef variable.
+        // These vars are pointers to static CFStringRef variables.
         let property_input_source_id = *(id_var as *const CFStringRef);
+        let property_input_source_languages = *(languages_var as *const CFStringRef);
+        let property_input_source_is_select_capable = *(selectable_var as *const CFStringRef);
 
         Some(TisApi {
             copy_current: std::mem::transmute::<*mut c_void, FnTisCopyCurrent>(copy_current),
@@ -275,6 +305,8 @@ fn tis_api() -> Option<&'static TisApi> {
             get_property: std::mem::transmute::<*mut c_void, FnTisGetProperty>(get_property),
             select: std::mem::transmute::<*mut c_void, FnTisSelect>(select),
             property_input_source_id,
+            property_input_source_languages,
+            property_input_source_is_select_capable,
         })
     })
     .as_ref()
@@ -283,6 +315,7 @@ fn tis_api() -> Option<&'static TisApi> {
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     fn CFRelease(cf: *const c_void);
+    fn CFBooleanGetValue(boolean: CFBooleanRef) -> bool;
     fn CFStringGetCString(s: CFStringRef, buf: *mut u8, len: CFIndex, encoding: u32) -> bool;
     fn CFStringCreateWithCString(
         alloc: *const c_void,
@@ -614,6 +647,154 @@ fn applescript_api() -> Option<&'static AppleScriptApi> {
         .as_ref()
 }
 
+// ---- NSEvent media-key synthesis via Objective-C runtime + dlsym ----------
+//
+// macOS routes hardware volume / mute keys as NSSystemDefined events, not as
+// regular keyboard events. Posting CGKeyDown/CGKeyUp at kVK_VolumeUp etc. does
+// not change volume, so synthesize the same event shape used by hardware keys.
+
+const NSEVENT_TYPE_SYSTEM_DEFINED: u64 = 14;
+const NSEVENT_SUBTYPE_AUX_CONTROL: i64 = 8;
+const NX_KEYTYPE_SOUND_UP: u32 = 0;
+const NX_KEYTYPE_SOUND_DOWN: u32 = 1;
+const NX_KEYTYPE_MUTE: u32 = 7;
+const K_CG_HID_EVENT_TAP: u32 = 0;
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct NSPoint {
+    x: f64,
+    y: f64,
+}
+
+type FnNSEventOther = unsafe extern "C" fn(
+    cls: ObjcClass,
+    sel: ObjcSel,
+    event_type: u64,
+    location: NSPoint,
+    modifier_flags: u64,
+    timestamp: f64,
+    window_number: i64,
+    context: ObjcId,
+    subtype: i16,
+    data1: i64,
+    data2: i64,
+) -> ObjcId;
+
+type FnNSEventCGEvent = unsafe extern "C" fn(self_: ObjcId, sel: ObjcSel) -> *const c_void;
+
+struct MediaKeyApi {
+    nsevent_class: ObjcClass,
+    other_event_sel: ObjcSel,
+    cg_event_sel: ObjcSel,
+    other_event: FnNSEventOther,
+    cg_event_of: FnNSEventCGEvent,
+}
+
+unsafe impl Send for MediaKeyApi {}
+unsafe impl Sync for MediaKeyApi {}
+
+static MEDIA_KEY_API: std::sync::OnceLock<Option<MediaKeyApi>> = std::sync::OnceLock::new();
+
+fn media_key_api() -> Option<&'static MediaKeyApi> {
+    MEDIA_KEY_API
+        .get_or_init(|| unsafe {
+            let _appkit =
+                dlopen(c"/System/Library/Frameworks/AppKit.framework/AppKit".as_ptr(), RTLD_LAZY);
+            let get_class = dlsym(RTLD_DEFAULT, c"objc_getClass".as_ptr());
+            let sel_register = dlsym(RTLD_DEFAULT, c"sel_registerName".as_ptr());
+            let msg_send = dlsym(RTLD_DEFAULT, c"objc_msgSend".as_ptr());
+            if get_class.is_null() || sel_register.is_null() || msg_send.is_null() {
+                log::warn!("media-key: objc runtime missing");
+                return None;
+            }
+            let get_class: FnObjcGetClass = std::mem::transmute(get_class);
+            let sel_register: FnSelRegisterName = std::mem::transmute(sel_register);
+            let other_event: FnNSEventOther = std::mem::transmute(msg_send);
+            let cg_event_of: FnNSEventCGEvent = std::mem::transmute(msg_send);
+
+            let nsevent_class = get_class(c"NSEvent".as_ptr());
+            if nsevent_class.is_null() {
+                log::warn!("media-key: NSEvent class not found");
+                return None;
+            }
+            let other_event_sel = sel_register(
+                c"otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:subtype:data1:data2:".as_ptr(),
+            );
+            let cg_event_sel = sel_register(c"CGEvent".as_ptr());
+            Some(MediaKeyApi {
+                nsevent_class,
+                other_event_sel,
+                cg_event_sel,
+                other_event,
+                cg_event_of,
+            })
+        })
+        .as_ref()
+}
+
+fn post_media_key(key_type: u32, fine_step: bool) {
+    const NSEVENT_MOD_SHIFT: u64 = 1 << 17;
+    const NSEVENT_MOD_OPTION: u64 = 1 << 19;
+    let fine_mods: u64 = if fine_step {
+        NSEVENT_MOD_SHIFT | NSEVENT_MOD_OPTION
+    } else {
+        0
+    };
+
+    let Some(media) = media_key_api() else {
+        log::warn!("post_media_key: API unavailable");
+        return;
+    };
+    let pool_api = applescript_api();
+    unsafe {
+        let pool = pool_api.map(|p| {
+            let alloc = (p.msg_send_0)(p.nsautoreleasepool_class, p.alloc_sel);
+            if alloc.is_null() {
+                std::ptr::null()
+            } else {
+                (p.msg_send_0)(alloc, p.init_sel)
+            }
+        });
+
+        for &down in &[true, false] {
+            let flags: u64 = (if down { 0xa00 } else { 0xb00 }) | fine_mods;
+            let state_nibble: i64 = if down { 0xa } else { 0xb };
+            let data1: i64 = ((key_type as i64) << 16) | (state_nibble << 8);
+
+            let nsevent = (media.other_event)(
+                media.nsevent_class,
+                media.other_event_sel,
+                NSEVENT_TYPE_SYSTEM_DEFINED,
+                NSPoint { x: 0.0, y: 0.0 },
+                flags,
+                0.0,
+                0,
+                std::ptr::null(),
+                NSEVENT_SUBTYPE_AUX_CONTROL as i16,
+                data1,
+                -1,
+            );
+            if nsevent.is_null() {
+                log::warn!("post_media_key: NSEvent creation returned nil");
+                continue;
+            }
+            let cg_event = (media.cg_event_of)(nsevent, media.cg_event_sel);
+            if cg_event.is_null() {
+                log::warn!("post_media_key: -[NSEvent CGEvent] returned NULL");
+                continue;
+            }
+            CGEventPost(K_CG_HID_EVENT_TAP, cg_event);
+        }
+
+        if let (Some(p), Some(pool_obj)) = (pool_api, pool) {
+            if !pool_obj.is_null() {
+                let _ = (p.msg_send_0)(pool_obj, p.drain_sel);
+            }
+        }
+    }
+}
+
 /// Compiles and executes a one-shot AppleScript using NSAppleScript in this
 /// process. Returns `true` on success; `false` if the runtime was unavailable
 /// or the source couldn't be turned into an NSString. AppleScript runtime
@@ -676,15 +857,11 @@ fn cfstring_from(s: &str) -> CFStringRef {
     }
 }
 
-fn input_source_id(api: &TisApi, source: TISInputSourceRef) -> Option<String> {
+fn cfstring_to_string(s: CFStringRef) -> Option<String> {
     unsafe {
-        let id_ref = (api.get_property)(source, api.property_input_source_id);
-        if id_ref.is_null() {
-            return None;
-        }
         let mut buf = [0u8; 256];
         if !CFStringGetCString(
-            id_ref as CFStringRef,
+            s,
             buf.as_mut_ptr(),
             buf.len() as CFIndex,
             K_CF_STRING_ENCODING_UTF8,
@@ -696,13 +873,51 @@ fn input_source_id(api: &TisApi, source: TISInputSourceRef) -> Option<String> {
     }
 }
 
+fn input_source_id(api: &TisApi, source: TISInputSourceRef) -> Option<String> {
+    unsafe {
+        let id_ref = (api.get_property)(source, api.property_input_source_id);
+        if id_ref.is_null() {
+            return None;
+        }
+        cfstring_to_string(id_ref as CFStringRef)
+    }
+}
+
+fn input_source_has_language(api: &TisApi, source: TISInputSourceRef, language: &str) -> bool {
+    unsafe {
+        let languages_ref = (api.get_property)(source, api.property_input_source_languages);
+        if languages_ref.is_null() {
+            return false;
+        }
+        let languages = languages_ref as CFArrayRef;
+        let count = CFArrayGetCount(languages);
+        for i in 0..count {
+            let lang_ref = CFArrayGetValueAtIndex(languages, i) as CFStringRef;
+            if lang_ref.is_null() {
+                continue;
+            }
+            if cfstring_to_string(lang_ref).as_deref() == Some(language) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn input_source_is_selectable(api: &TisApi, source: TISInputSourceRef) -> bool {
+    unsafe {
+        let selectable_ref =
+            (api.get_property)(source, api.property_input_source_is_select_capable);
+        !selectable_ref.is_null() && CFBooleanGetValue(selectable_ref as CFBooleanRef)
+    }
+}
+
 /// Toggle between a Korean input source and a roman keyboard layout.
-/// Inspects the currently selected source's ID; if Korean, switches to en
-/// via TISCopyInputSourceForLanguage. Korean direction requires a selectable
-/// *input mode* (e.g. com.apple.inputmethod.Korean.2SetKorean), which is only
-/// reachable through the enabled-source list — TISCopyInputSourceForLanguage
-/// returns the parent input *method* (com.apple.inputmethod.Korean) and
-/// TISSelectInputSource rejects it with paramErr.
+/// Inspects the currently selected source's language list; if it supports
+/// Korean, switches to en via TISCopyInputSourceForLanguage. Korean direction
+/// walks the enabled-source list and selects a source that declares `ko` and is
+/// select-capable. This covers both Apple's input modes and third-party input
+/// methods without modes.
 fn toggle_korean_input_source() {
     let Some(api) = tis_api() else {
         log::warn!("TIS: API unavailable");
@@ -714,10 +929,10 @@ fn toggle_korean_input_source() {
             log::warn!("TIS: failed to get current input source");
             return;
         }
-        let current_id = input_source_id(api, current).unwrap_or_default();
+        let current_is_korean = input_source_has_language(api, current, "ko");
         CFRelease(current);
 
-        let want_korean = !current_id.contains("Korean");
+        let want_korean = !current_is_korean;
 
         if !want_korean {
             // English direction: language lookup returns the keyboard layout
@@ -745,8 +960,7 @@ fn toggle_korean_input_source() {
         }
 
         // Korean direction: walk the enabled input-source list and pick the
-        // first source whose ID contains "Korean" (this is the input mode,
-        // not the parent method).
+        // first selectable source that declares Korean support.
         let Some(create_list) = api.create_list else {
             log::warn!("TIS: input-source list unavailable; cannot select Korean");
             return;
@@ -760,14 +974,10 @@ fn toggle_korean_input_source() {
         let mut selected = false;
         for i in 0..count {
             let source = CFArrayGetValueAtIndex(list, i) as TISInputSourceRef;
-            let id = match input_source_id(api, source) {
-                Some(s) => s,
-                None => continue,
-            };
-            // Korean input modes have an extra dotted suffix
-            // (e.g. com.apple.inputmethod.Korean.2SetKorean). The bare
-            // bundle id is not selectable.
-            if id.contains("Korean") && id.matches('.').count() > 3 {
+            if input_source_has_language(api, source, "ko")
+                && input_source_is_selectable(api, source)
+            {
+                let id = input_source_id(api, source).unwrap_or_else(|| "<unknown>".to_string());
                 let status = (api.select)(source);
                 if status == 0 {
                     log::info!("TIS: switched to {id}");
@@ -1164,7 +1374,7 @@ impl Emulation for MacOSEmulation {
                     let remap_to_ime_toggle = key == 100;
                     if remap_to_ime_toggle {
                         log::debug!("Right Alt -> Korean IME toggle (state={state})");
-                        if state == 1 {
+                        if state == 1 && self.accept_ime_toggle() {
                             toggle_korean_input_source();
                         }
                         return Ok(());
@@ -1188,6 +1398,30 @@ impl Emulation for MacOSEmulation {
                             if state == 1 {
                                 log::debug!("F11 -> Show Desktop");
                                 trigger_show_desktop();
+                            }
+                            return Ok(());
+                        }
+                        113 => {
+                            // evdev KEY_MUTE
+                            if state == 1 {
+                                log::debug!("Mute key -> NSSystemDefined MUTE");
+                                post_media_key(NX_KEYTYPE_MUTE, false);
+                            }
+                            return Ok(());
+                        }
+                        114 => {
+                            // evdev KEY_VOLUMEDOWN, with fine-step modifiers.
+                            if state == 1 {
+                                log::debug!("VolumeDown -> NSSystemDefined SOUND_DOWN (fine)");
+                                post_media_key(NX_KEYTYPE_SOUND_DOWN, true);
+                            }
+                            return Ok(());
+                        }
+                        115 => {
+                            // evdev KEY_VOLUMEUP, with fine-step modifiers.
+                            if state == 1 {
+                                log::debug!("VolumeUp -> NSSystemDefined SOUND_UP (fine)");
+                                post_media_key(NX_KEYTYPE_SOUND_UP, true);
                             }
                             return Ok(());
                         }

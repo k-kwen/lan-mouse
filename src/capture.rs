@@ -5,8 +5,11 @@ use std::{
 };
 
 use futures::StreamExt;
+#[cfg(target_os = "macos")]
+use input_capture::error::MacosCaptureCreationError;
 use input_capture::{
-    CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
+    CaptureCreationError, CaptureError, CaptureEvent, CaptureHandle, InputCapture,
+    InputCaptureError, Position,
 };
 use input_event::{Event, KeyboardEvent, scancode};
 use lan_mouse_proto::ProtoEvent;
@@ -15,6 +18,9 @@ use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
 
 use crate::connect::LanMouseConnection;
+
+const CAPTURE_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(1);
+const CAPTURE_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
 
 pub(crate) struct Capture {
     cancellation_token: CancellationToken,
@@ -238,26 +244,66 @@ impl CaptureTask {
     }
 
     async fn run(mut self) {
+        let mut retry_delay = CAPTURE_RETRY_INITIAL_DELAY;
         loop {
-            if let Err(e) = self.do_capture().await {
-                log::warn!("input capture exited: {e}");
-            }
-            loop {
-                tokio::select! {
-                    r = self.request_rx.recv() => match r.expect("channel closed") {
-                        CaptureRequest::Reenable => break,
-                        CaptureRequest::Create(h, p, t) => self.add_capture(h, p, t),
-                        CaptureRequest::Destroy(h) => self.remove_capture(h),
-                        CaptureRequest::ReleaseForHandover => { /* nothing to do */ }
-                        CaptureRequest::SetReleaseBind(bind) => {
-                            self.release_bind.borrow_mut().clone_from(&bind);
-                        }
-                        CaptureRequest::SetReleaseThreshold(threshold) => {
-                            *self.release_threshold_px.borrow_mut() = threshold;
-                        }
-                    },
-                    _ = self.cancellation_token.cancelled() => return,
+            match self.do_capture().await {
+                Ok(()) => {
+                    retry_delay = CAPTURE_RETRY_INITIAL_DELAY;
                 }
+                Err(e) => {
+                    let should_auto_retry = should_auto_retry_capture(&e);
+                    log::warn!("input capture exited: {e}");
+
+                    if should_auto_retry {
+                        let delay = retry_delay;
+                        retry_delay = (retry_delay.saturating_mul(2)).min(CAPTURE_RETRY_MAX_DELAY);
+                        log::info!(
+                            "input capture will auto-restart in {}s after recoverable macOS event-tap interruption",
+                            delay.as_secs()
+                        );
+                        if self.wait_for_reenable_or_retry(Some(delay)).await {
+                            continue;
+                        }
+                        return;
+                    }
+
+                    retry_delay = CAPTURE_RETRY_INITIAL_DELAY;
+                }
+            }
+
+            if !self.wait_for_reenable_or_retry(None).await {
+                return;
+            }
+        }
+    }
+
+    async fn wait_for_reenable_or_retry(&mut self, retry_after: Option<Duration>) -> bool {
+        let retry_sleep = retry_after.map(tokio::time::sleep);
+        tokio::pin!(retry_sleep);
+
+        loop {
+            tokio::select! {
+                _ = async {
+                    match retry_sleep.as_mut().as_pin_mut() {
+                        Some(sleep) => sleep.await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    return true;
+                }
+                r = self.request_rx.recv() => match r.expect("channel closed") {
+                    CaptureRequest::Reenable => return true,
+                    CaptureRequest::Create(h, p, t) => self.add_capture(h, p, t),
+                    CaptureRequest::Destroy(h) => self.remove_capture(h),
+                    CaptureRequest::ReleaseForHandover => { /* nothing to do */ }
+                    CaptureRequest::SetReleaseBind(bind) => {
+                        self.release_bind.borrow_mut().clone_from(&bind);
+                    }
+                    CaptureRequest::SetReleaseThreshold(threshold) => {
+                        *self.release_threshold_px.borrow_mut() = threshold;
+                    }
+                },
+                _ = self.cancellation_token.cancelled() => return false,
             }
         }
     }
@@ -589,6 +635,48 @@ impl CaptureTask {
                 log::warn!("failed to send Leave to client {handle}: {e}");
             }
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn should_auto_retry_capture(error: &InputCaptureError) -> bool {
+    matches!(
+        error,
+        InputCaptureError::Capture(CaptureError::EventTapDisabled)
+            | InputCaptureError::Create(CaptureCreationError::MacOS(
+                MacosCaptureCreationError::EventTapCreation
+            ))
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn should_auto_retry_capture(_error: &InputCaptureError) -> bool {
+    false
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_tap_disabled_is_auto_recoverable_on_macos() {
+        assert!(should_auto_retry_capture(&InputCaptureError::Capture(
+            CaptureError::EventTapDisabled,
+        )));
+    }
+
+    #[test]
+    fn event_tap_creation_is_auto_recoverable_on_macos() {
+        assert!(should_auto_retry_capture(&InputCaptureError::Create(
+            CaptureCreationError::MacOS(MacosCaptureCreationError::EventTapCreation),
+        )));
+    }
+
+    #[test]
+    fn missing_accessibility_permission_is_not_auto_recoverable_on_macos() {
+        assert!(!should_auto_retry_capture(&InputCaptureError::Create(
+            CaptureCreationError::MacOS(MacosCaptureCreationError::AccessibilityPermission),
+        )));
     }
 }
 
