@@ -324,136 +324,29 @@ unsafe extern "C" {
     ) -> CFStringRef;
     fn CFArrayGetCount(arr: CFArrayRef) -> CFIndex;
     fn CFArrayGetValueAtIndex(arr: CFArrayRef, idx: CFIndex) -> *const c_void;
-    fn CFDictionaryGetValue(dict: *const c_void, key: *const c_void) -> *const c_void;
-    fn CFNumberGetValue(num: *const c_void, the_type: i64, value_ptr: *mut c_void) -> bool;
 }
 
-#[link(name = "CoreGraphics", kind = "framework")]
-unsafe extern "C" {
-    fn CGWindowListCopyWindowInfo(option: u32, relative_to: u32) -> CFArrayRef;
-    static kCGWindowOwnerName: CFStringRef;
-    static kCGWindowLayer: CFStringRef;
-}
-
-const K_CF_NUMBER_SINT32_TYPE: i64 = 3;
-const K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY: u32 = 1;
-const K_CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS: u32 = 1 << 4;
-
-/// Returns the owner-name of the topmost on-screen regular-app window
-/// (layer == 0). Used to route mouse4/mouse5 differently depending on
-/// the frontmost app (browsers/Finder keep back-forward semantics).
-fn frontmost_window_owner_name() -> Option<String> {
-    unsafe {
-        let arr = CGWindowListCopyWindowInfo(
-            K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY | K_CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS,
-            0,
-        );
-        if arr.is_null() {
-            return None;
-        }
-        let mut result: Option<String> = None;
-        let count = CFArrayGetCount(arr);
-        for i in 0..count {
-            let dict = CFArrayGetValueAtIndex(arr, i);
-            if dict.is_null() {
-                continue;
-            }
-            let layer_val = CFDictionaryGetValue(dict, kCGWindowLayer as *const c_void);
-            if layer_val.is_null() {
-                continue;
-            }
-            let mut layer: i32 = 0;
-            if !CFNumberGetValue(
-                layer_val,
-                K_CF_NUMBER_SINT32_TYPE,
-                &mut layer as *mut i32 as *mut c_void,
-            ) {
-                continue;
-            }
-            if layer != 0 {
-                continue;
-            }
-            let name_val = CFDictionaryGetValue(dict, kCGWindowOwnerName as *const c_void);
-            if name_val.is_null() {
-                continue;
-            }
-            let mut buf = [0u8; 256];
-            if !CFStringGetCString(
-                name_val as CFStringRef,
-                buf.as_mut_ptr(),
-                buf.len() as CFIndex,
-                K_CF_STRING_ENCODING_UTF8,
-            ) {
-                continue;
-            }
-            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-            result = std::str::from_utf8(&buf[..end]).ok().map(|s| s.to_string());
-            break;
-        }
-        CFRelease(arr);
-        result
+fn canonical_side_button(button: u32) -> Option<u32> {
+    match button {
+        BTN_BACK | 3 => Some(BTN_BACK),
+        BTN_FORWARD | 4 => Some(BTN_FORWARD),
+        _ => None,
     }
 }
 
-/// How a mouse4/mouse5 press should be routed based on the frontmost app.
-enum BackForwardRoute {
-    /// Forward the press as a standard OtherMouse button 3/4 event — the app
-    /// handles it natively (browsers).
-    Passthrough,
-    /// Synthesize ⌘+[ / ⌘+] — the app exposes navigation only via that menu
-    /// shortcut, not via raw side-buttons (Finder).
-    CmdBracket,
-    /// Trigger Mission Control / Show Desktop via a trusted path
-    /// (`open -a` / AppleScript System Events).
-    SystemShortcut,
-}
-
-fn back_forward_route(name: Option<&str>) -> BackForwardRoute {
-    match name {
-        Some("Google Chrome" | "Safari") => BackForwardRoute::Passthrough,
-        Some("Finder") => BackForwardRoute::CmdBracket,
-        _ => BackForwardRoute::SystemShortcut,
-    }
-}
-
-/// Synthesizes a ⌘+<key> chord. Used for Finder back/forward (⌘+[ and ⌘+]).
-/// App menu shortcuts are accepted from synthetic CGEvents (only *system*
-/// shortcut triggers like F9/F11 get rejected).
-///
-/// Wraps the chord with explicit FlagsChanged events so the system sees a
-/// clean ⌘-press / ⌘-release boundary — without the final release event,
-/// macOS leaves the modifier stuck, and the next left click is interpreted
-/// as ⌘+Click (no window focus, action happens in place, looks like a
-/// drag-without-focus bug).
-fn send_cmd_key(event_source: CGEventSource, mac_keycode: u16, current_mods: XMods) {
-    let mods_with_cmd = to_cgevent_flags(current_mods) | CGEventFlags::CGEventFlagCommand;
-    let mods_restored = to_cgevent_flags(current_mods);
-
-    // 1. Tell the system ⌘ is now down.
-    if let Ok(e) = CGEvent::new(event_source.clone()) {
-        e.set_type(CGEventType::FlagsChanged);
-        e.set_flags(mods_with_cmd);
-        e.post(CGEventTapLocation::HID);
-    }
-    // 2. Key down.
-    if let Ok(e) = CGEvent::new_keyboard_event(event_source.clone(), mac_keycode, true) {
-        e.set_flags(mods_with_cmd);
-        e.post(CGEventTapLocation::HID);
+fn side_button_name(button: u32) -> &'static str {
+    if button == BTN_BACK {
+        "back"
     } else {
-        log::warn!("send_cmd_key: keydown creation failed");
+        "forward"
     }
-    // 3. Key up.
-    if let Ok(e) = CGEvent::new_keyboard_event(event_source.clone(), mac_keycode, false) {
-        e.set_flags(mods_with_cmd);
-        e.post(CGEventTapLocation::HID);
-    } else {
-        log::warn!("send_cmd_key: keyup creation failed");
-    }
-    // 4. Release ⌘ — restore the modifier state lan-mouse was tracking.
-    if let Ok(e) = CGEvent::new(event_source) {
-        e.set_type(CGEventType::FlagsChanged);
-        e.set_flags(mods_restored);
-        e.post(CGEventTapLocation::HID);
+}
+
+fn side_button_cg_number(button: u32) -> Option<i64> {
+    match canonical_side_button(button) {
+        Some(BTN_BACK) => Some(3),
+        Some(BTN_FORWARD) => Some(4),
+        _ => None,
     }
 }
 
@@ -995,6 +888,28 @@ fn toggle_korean_input_source() {
     }
 }
 
+fn reselect_current_input_source(reason: &str) {
+    let Some(api) = tis_api() else {
+        log::warn!("TIS: API unavailable while refreshing input source ({reason})");
+        return;
+    };
+    unsafe {
+        let current = (api.copy_current)();
+        if current.is_null() {
+            log::warn!("TIS: failed to get current input source while refreshing ({reason})");
+            return;
+        }
+        let id = input_source_id(api, current).unwrap_or_else(|| "<unknown>".to_string());
+        let status = (api.select)(current);
+        CFRelease(current);
+        if status == 0 {
+            log::info!("TIS: refreshed current input source {id} ({reason})");
+        } else {
+            log::warn!("TIS: refresh {id} failed ({reason}, OSStatus {status})");
+        }
+    }
+}
+
 fn key_event(event_source: CGEventSource, key: u16, state: u8, modifiers: XMods) {
     let event = match CGEvent::new_keyboard_event(event_source, key, state != 0) {
         Ok(e) => e,
@@ -1165,68 +1080,35 @@ impl Emulation for MacOSEmulation {
                         button,
                         state,
                     } => {
-                        // Route mouse4 (BTN_BACK) / mouse5 (BTN_FORWARD) to
-                        // F9 (Mission Control) / F11 (Show Desktop) unless the
-                        // frontmost app is a browser/Finder, where back-forward
-                        // is the natural behavior.
-                        if matches!(button, BTN_BACK | BTN_FORWARD) {
+                        // Route side buttons to F9/F11 unconditionally. Accept
+                        // both lan-mouse's evdev BTN_BACK/FORWARD constants and
+                        // raw macOS OtherMouse button numbers 3/4 so older or
+                        // platform-specific peers do not fall through as normal
+                        // back/forward mouse events.
+                        if let Some(side_button) = canonical_side_button(button) {
                             if state == 1 {
-                                let owner = frontmost_window_owner_name();
-                                match back_forward_route(owner.as_deref()) {
-                                    BackForwardRoute::Passthrough => {
-                                        // fall through to existing OtherMouseDown logic
-                                    }
-                                    BackForwardRoute::CmdBracket => {
-                                        let bracket_key: u16 = if button == BTN_BACK {
-                                            0x21 // "["
-                                        } else {
-                                            0x1E // "]"
-                                        };
-                                        log::debug!(
-                                            "mouse{} -> ⌘+{} (frontmost: {:?})",
-                                            if button == BTN_BACK { 4 } else { 5 },
-                                            if button == BTN_BACK { "[" } else { "]" },
-                                            owner
-                                        );
-                                        send_cmd_key(
-                                            self.event_source.clone(),
-                                            bracket_key,
-                                            self.modifier_state.get(),
-                                        );
-                                        self.synth_keyed_buttons.insert(button);
-                                        return Ok(());
-                                    }
-                                    BackForwardRoute::SystemShortcut => {
-                                        log::debug!(
-                                            "mouse{} -> {} (frontmost: {:?})",
-                                            if button == BTN_BACK { 4 } else { 5 },
-                                            if button == BTN_BACK {
-                                                "Mission Control"
-                                            } else {
-                                                "Show Desktop"
-                                            },
-                                            owner
-                                        );
-                                        if button == BTN_BACK {
-                                            trigger_mission_control();
-                                        } else {
-                                            trigger_show_desktop();
-                                        }
-                                        self.synth_keyed_buttons.insert(button);
-                                        return Ok(());
-                                    }
+                                if side_button == BTN_BACK {
+                                    log::info!(
+                                        "side mouse button {} (raw={button}) -> F9 / Mission Control",
+                                        side_button_name(side_button)
+                                    );
+                                    trigger_mission_control();
+                                } else {
+                                    log::info!(
+                                        "side mouse button {} (raw={button}) -> F11 / Show Desktop",
+                                        side_button_name(side_button)
+                                    );
+                                    trigger_show_desktop();
                                 }
-                            } else if self.synth_keyed_buttons.remove(&button) {
+                                self.synth_keyed_buttons.insert(side_button);
+                                return Ok(());
+                            } else if self.synth_keyed_buttons.remove(&side_button) {
                                 // matching release for a synth-routed press
                                 return Ok(());
                             }
                         }
                         // button number for OtherMouse events (3 = back, 4 = forward, etc.)
-                        let cg_button_number: Option<i64> = match button {
-                            BTN_BACK => Some(3),
-                            BTN_FORWARD => Some(4),
-                            _ => None,
-                        };
+                        let cg_button_number = side_button_cg_number(button);
                         let (event_type, mouse_button) = match (button, state) {
                             (BTN_LEFT, 1) => (CGEventType::LeftMouseDown, CGMouseButton::Left),
                             (BTN_LEFT, 0) => (CGEventType::LeftMouseUp, CGMouseButton::Left),
@@ -1460,9 +1342,14 @@ impl Emulation for MacOSEmulation {
         Ok(())
     }
 
-    async fn create(&mut self, _handle: EmulationHandle) {}
+    async fn create(&mut self, _handle: EmulationHandle) {
+        self.last_ime_toggle = None;
+        reselect_current_input_source("remote enter");
+    }
 
-    async fn destroy(&mut self, _handle: EmulationHandle) {}
+    async fn destroy(&mut self, _handle: EmulationHandle) {
+        self.last_ime_toggle = None;
+    }
 
     async fn terminate(&mut self) {}
 
