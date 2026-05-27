@@ -696,6 +696,14 @@ fn input_source_id(api: &TisApi, source: TISInputSourceRef) -> Option<String> {
     }
 }
 
+fn is_korean_input_source_id(id: &str) -> bool {
+    id.to_ascii_lowercase().contains("korean")
+}
+
+fn is_selectable_korean_input_mode_id(id: &str) -> bool {
+    is_korean_input_source_id(id) && id.matches('.').count() > 3
+}
+
 /// Toggle between a Korean input source and a roman keyboard layout.
 /// Inspects the currently selected source's ID; if Korean, switches to en
 /// via TISCopyInputSourceForLanguage. Korean direction requires a selectable
@@ -717,7 +725,7 @@ fn toggle_korean_input_source() {
         let current_id = input_source_id(api, current).unwrap_or_default();
         CFRelease(current);
 
-        let want_korean = !current_id.contains("Korean");
+        let want_korean = !is_korean_input_source_id(&current_id);
 
         if !want_korean {
             // English direction: language lookup returns the keyboard layout
@@ -767,7 +775,7 @@ fn toggle_korean_input_source() {
             // Korean input modes have an extra dotted suffix
             // (e.g. com.apple.inputmethod.Korean.2SetKorean). The bare
             // bundle id is not selectable.
-            if id.contains("Korean") && id.matches('.').count() > 3 {
+            if is_selectable_korean_input_mode_id(&id) {
                 let status = (api.select)(source);
                 if status == 0 {
                     log::info!("TIS: switched to {id}");
@@ -1341,5 +1349,34 @@ bitflags! {
         const Mod3Mask = (1<<5);
         const Mod4Mask = (1<<6);
         const Mod5Mask = (1<<7);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_korean_input_source_id, is_selectable_korean_input_mode_id};
+
+    #[test]
+    fn detects_korean_input_source_ids_case_insensitively() {
+        assert!(is_korean_input_source_id(
+            "com.apple.inputmethod.Korean.2SetKorean"
+        ));
+        assert!(is_korean_input_source_id(
+            "com.pritype.inputmethod.v2.korean"
+        ));
+        assert!(!is_korean_input_source_id("com.apple.keylayout.ABC"));
+    }
+
+    #[test]
+    fn selectable_korean_modes_exclude_bare_parent_methods() {
+        assert!(is_selectable_korean_input_mode_id(
+            "com.apple.inputmethod.Korean.2SetKorean"
+        ));
+        assert!(is_selectable_korean_input_mode_id(
+            "com.pritype.inputmethod.v2.korean"
+        ));
+        assert!(!is_selectable_korean_input_mode_id(
+            "com.apple.inputmethod.Korean"
+        ));
     }
 }
