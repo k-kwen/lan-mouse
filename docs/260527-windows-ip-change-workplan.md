@@ -46,6 +46,10 @@ activate_on_startup = true
 
 - Active client hostnames are resolved every 30 seconds.
 - If mDNS browse is delayed or lost, the OS resolver can still refresh `.local` / DNS IP candidates.
+- Hostname refresh only runs for active clients that do not currently have an active DTLS address.
+- If a peer has no usable address candidates, no DTLS connect task is spawned on edge crossing.
+- Capture is not armed while the peer is unresolved or in retry backoff, so the daemon stays light when the peer is offline.
+- Repeated identical DNS failures are logged at debug level after the first warning.
 - `cli list` prints `alive`, `resolving`, `active_addr`, and `peer_commit`.
 
 ## Windows Build
@@ -92,6 +96,7 @@ Expected:
 - UDP 4242 listens on the current Windows LAN IP.
 - `cli list` includes `peer_fingerprint`, `alive`, `resolving`, and optionally `active_addr`.
 - If Mac is reachable through the same mDNS/LAN domain, `discover` shows the Mac fingerprint.
+- If Mac is not reachable, edge crossing logs at most occasional `capture not armed` messages and does not create repeated DTLS work.
 
 ## Push For Mac
 

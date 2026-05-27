@@ -13,6 +13,14 @@ Keep `ips = []`. Peer trust is the Windows DTLS certificate fingerprint, not its
 
 Tailscale is diagnostic-only. Do not put `100.x.x.x` in config for this plan.
 
+When Windows is not discoverable, the Mac daemon must keep running but stay light:
+
+- Keep UDP 4242 listening and mDNS advertisement alive.
+- Do not arm capture when the Windows peer has no address candidates.
+- Do not spawn DTLS connect tasks while unresolved or in retry backoff.
+- Retry through mDNS browse, last-success, and low-rate hostname refresh once candidates appear.
+- Repeated identical DNS failures should not fill the log.
+
 ## Fingerprints
 
 Windows:
@@ -183,6 +191,7 @@ Expected:
 - The advertised fingerprint equals `7c:af:...:59`.
 - `Cmd + right edge` produces `client 0 acknowledged the connection!` or `client (0) connected`.
 - Windows -> Mac still works from the Windows left edge.
+- If Windows is not reachable, `Cmd + right edge` should not freeze or wait on repeated connection attempts; the log should show occasional `capture not armed` messages instead.
 
 ## Failure Branches
 

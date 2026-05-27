@@ -71,6 +71,22 @@ struct RetryState {
     signature: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConnectionAttemptStatus {
+    Connected,
+    Started,
+    Pending,
+    CoolingDown,
+    Unresolved,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AttemptDecision {
+    Attempt,
+    CoolingDown,
+    Unresolved,
+}
+
 fn signature_of(ips: &HashSet<IpAddr>, primary: Option<IpAddr>) -> u64 {
     let mut sorted: Vec<IpAddr> = ips.iter().copied().collect();
     sorted.sort();
@@ -101,6 +117,23 @@ fn record_retry_failure(
     let next = entry.backoff;
     entry.next_attempt_at = Instant::now() + next;
     entry.backoff = (next * 2).min(MAX_RETRY_BACKOFF);
+}
+
+fn address_candidates_for(
+    client_manager: &ClientManager,
+    handle: ClientHandle,
+    primary_hints: &PrimaryCache,
+    fingerprint_hints: &FingerprintCache,
+) -> (HashSet<IpAddr>, Option<IpAddr>) {
+    let mut ips = client_manager.get_ips(handle).unwrap_or_default();
+    ips.retain(|ip| is_usable_candidate_ip(*ip));
+    ips.extend(discovery_candidates_for(
+        client_manager,
+        handle,
+        fingerprint_hints,
+    ));
+    let primary = discovery_hint_for(client_manager, handle, primary_hints, fingerprint_hints);
+    (ips, primary)
 }
 
 fn discovery_hint_for(
@@ -357,63 +390,92 @@ impl LanMouseConnection {
     }
 
     pub(crate) async fn ensure_connected(&self, handle: ClientHandle) -> bool {
+        matches!(
+            self.ensure_connection_started(handle).await,
+            ConnectionAttemptStatus::Connected
+        )
+    }
+
+    pub(crate) async fn ensure_connection_started(
+        &self,
+        handle: ClientHandle,
+    ) -> ConnectionAttemptStatus {
         if self.is_connected(handle).await {
-            return true;
+            return ConnectionAttemptStatus::Connected;
         }
         let mut connecting = self.connecting.lock().await;
-        if !connecting.contains(&handle) && self.should_attempt(handle) {
-            connecting.insert(handle);
-            spawn_local(connect_to_handle(
-                self.client_manager.clone(),
-                self.cert.clone(),
-                handle,
-                self.conns.clone(),
-                self.connecting.clone(),
-                self.recv_tx.clone(),
-                self.ping_response.clone(),
-                self.primary_hints.clone(),
-                self.fingerprint_hints.clone(),
-                self.retry_state.clone(),
-                self.last_success_cache_path.clone(),
-            ));
+        if connecting.contains(&handle) {
+            return ConnectionAttemptStatus::Pending;
         }
-        false
+        match self.attempt_decision(handle) {
+            AttemptDecision::Attempt => {
+                connecting.insert(handle);
+                spawn_local(connect_to_handle(
+                    self.client_manager.clone(),
+                    self.cert.clone(),
+                    handle,
+                    self.conns.clone(),
+                    self.connecting.clone(),
+                    self.recv_tx.clone(),
+                    self.ping_response.clone(),
+                    self.primary_hints.clone(),
+                    self.fingerprint_hints.clone(),
+                    self.retry_state.clone(),
+                    self.last_success_cache_path.clone(),
+                ));
+                ConnectionAttemptStatus::Started
+            }
+            AttemptDecision::CoolingDown => ConnectionAttemptStatus::CoolingDown,
+            AttemptDecision::Unresolved => ConnectionAttemptStatus::Unresolved,
+        }
     }
 
     /// Decide whether to spawn another `connect_to_handle` for `handle`.
-    /// Returns true (and refreshes the recorded signature) when:
+    /// Returns [`AttemptDecision::Attempt`] when:
     ///   - we have no prior attempt for this handle, or
     ///   - the candidate-set signature has changed since the last
     ///     attempt (new IP from DNS, or new mDNS primary), or
     ///   - the recorded backoff has elapsed.
     ///
-    /// Otherwise returns false; the caller treats this as "still in
-    /// cooldown, keep returning NotConnected silently."
-    fn should_attempt(&self, handle: ClientHandle) -> bool {
-        let mut ips = self.client_manager.get_ips(handle).unwrap_or_default();
-        ips.retain(|ip| is_usable_candidate_ip(*ip));
-        ips.extend(discovery_candidates_for(
-            &self.client_manager,
-            handle,
-            &self.fingerprint_hints,
-        ));
-        let primary = discovery_hint_for(
+    /// If no usable address candidate exists, no DTLS task is spawned.
+    /// The daemon stays light: it keeps mDNS/listeners alive and waits
+    /// for DNS/mDNS/last-success candidates to change the signature.
+    fn attempt_decision(&self, handle: ClientHandle) -> AttemptDecision {
+        let (ips, primary) = address_candidates_for(
             &self.client_manager,
             handle,
             &self.primary_hints,
             &self.fingerprint_hints,
         );
+        let has_candidates = !ips.is_empty() || primary.is_some();
         let sig = signature_of(&ips, primary);
         let mut state = self.retry_state.borrow_mut();
         match state.get_mut(&handle) {
-            None => true,
+            None if has_candidates => AttemptDecision::Attempt,
+            None => {
+                drop(state);
+                record_retry_failure(&self.retry_state, handle, &ips, primary);
+                AttemptDecision::Unresolved
+            }
             Some(s) if s.signature != sig => {
                 s.signature = sig;
                 s.next_attempt_at = Instant::now();
                 s.backoff = INITIAL_RETRY_BACKOFF;
-                true
+                if has_candidates {
+                    AttemptDecision::Attempt
+                } else {
+                    drop(state);
+                    record_retry_failure(&self.retry_state, handle, &ips, primary);
+                    AttemptDecision::Unresolved
+                }
             }
-            Some(s) => Instant::now() >= s.next_attempt_at,
+            Some(s) if Instant::now() < s.next_attempt_at => AttemptDecision::CoolingDown,
+            Some(_) if has_candidates => AttemptDecision::Attempt,
+            Some(_) => {
+                drop(state);
+                record_retry_failure(&self.retry_state, handle, &ips, primary);
+                AttemptDecision::Unresolved
+            }
         }
     }
 }

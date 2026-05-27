@@ -14,7 +14,7 @@ use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
 
-use crate::connect::LanMouseConnection;
+use crate::connect::{ConnectionAttemptStatus, LanMouseConnection};
 
 pub(crate) struct Capture {
     cancellation_token: CancellationToken,
@@ -217,7 +217,30 @@ impl CaptureTask {
         if self.conn.is_ready(handle).await {
             return true;
         }
-        self.conn.ensure_connected(handle).await;
+        let attempt_status = self.conn.ensure_connection_started(handle).await;
+        match attempt_status {
+            ConnectionAttemptStatus::Connected
+            | ConnectionAttemptStatus::Started
+            | ConnectionAttemptStatus::Pending => {}
+            ConnectionAttemptStatus::CoolingDown => {
+                const DUR: Duration = Duration::from_secs(5);
+                debounce!(
+                    PREV_LOG,
+                    DUR,
+                    log::info!("client {handle} is waiting for retry backoff; capture not armed")
+                );
+                return false;
+            }
+            ConnectionAttemptStatus::Unresolved => {
+                const DUR: Duration = Duration::from_secs(5);
+                debounce!(
+                    PREV_LOG,
+                    DUR,
+                    log::info!("client {handle} has no address candidates; capture not armed")
+                );
+                return false;
+            }
+        }
 
         log::info!("client {handle} is not ready yet; waiting for initial connection");
         let deadline = Instant::now() + TIMEOUT;

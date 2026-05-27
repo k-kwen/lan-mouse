@@ -62,6 +62,11 @@ pub struct Service {
     /// fingerprint-indexed address candidates learned from mDNS,
     /// successful outgoing connections, and observed incoming peers.
     fingerprint_cache: FingerprintCache,
+    /// Last DNS/hostname resolution error per client. Repeated
+    /// unresolved-hostname refreshes are expected when a peer is on a
+    /// different network, so only the first distinct error is logged as
+    /// a warning.
+    dns_resolution_errors: HashMap<ClientHandle, String>,
     /// notify for pending frontend events
     frontend_event_pending: Notify,
     /// frontend events queued for sending
@@ -164,6 +169,7 @@ impl Service {
             authorized_keys,
             public_key_fingerprint,
             fingerprint_cache,
+            dns_resolution_errors: Default::default(),
             client_manager,
             frontend_event_pending: Default::default(),
             port,
@@ -502,10 +508,23 @@ impl Service {
             }
             DnsEvent::Resolved(handle, hostname, ips) => {
                 self.client_manager.set_resolving(handle, false);
-                if let Err(e) = &ips {
-                    log::warn!("could not resolve {hostname}: {e}");
-                }
-                let ips = ips.unwrap_or_default();
+                let ips = match ips {
+                    Ok(ips) => {
+                        self.dns_resolution_errors.remove(&handle);
+                        ips
+                    }
+                    Err(e) => {
+                        let error = e.to_string();
+                        let repeated = self.dns_resolution_errors.get(&handle) == Some(&error);
+                        if repeated {
+                            log::debug!("could not resolve {hostname}: {error}");
+                        } else {
+                            log::warn!("could not resolve {hostname}: {error}");
+                            self.dns_resolution_errors.insert(handle, error);
+                        }
+                        Vec::new()
+                    }
+                };
                 self.client_manager.set_dns_ips(handle, ips);
                 handle
             }
@@ -521,7 +540,9 @@ impl Service {
 
     fn refresh_active_hostname_candidates(&self) {
         for handle in self.client_manager.active_clients() {
-            self.resolve(handle);
+            if self.client_manager.active_addr(handle).is_none() {
+                self.resolve(handle);
+            }
         }
     }
 
