@@ -205,6 +205,12 @@ impl Service {
         // skip the immediate-fire of the first tick — Discovery
         // already published once at startup
         discovery_refresh_tick.tick().await;
+        let mut address_refresh_tick = tokio::time::interval(Duration::from_secs(30));
+        address_refresh_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Active clients are resolved once during activation. Keep
+        // resolving them periodically as well so DHCP / network changes
+        // are picked up even when mDNS browse events are delayed or lost.
+        address_refresh_tick.tick().await;
         let mut health_tick = tokio::time::interval(Duration::from_secs(60));
         health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // skip the immediate-fire; startup events will establish the
@@ -221,6 +227,7 @@ impl Service {
                 event = self.resolver.event() => self.handle_resolver_event(event),
                 _ = self.config.changed() => self.handle_config_change(),
                 _ = discovery_refresh_tick.tick() => self.discovery.refresh(),
+                _ = address_refresh_tick.tick() => self.refresh_active_hostname_candidates(),
                 _ = health_tick.tick() => {
                     if let Err(e) = self.health_check() {
                         log::error!("{e}");
@@ -509,6 +516,12 @@ impl Service {
     fn resolve(&self, handle: ClientHandle) {
         if let Some(hostname) = self.client_manager.get_hostname(handle) {
             self.resolver.resolve(handle, hostname);
+        }
+    }
+
+    fn refresh_active_hostname_candidates(&self) {
+        for handle in self.client_manager.active_clients() {
+            self.resolve(handle);
         }
     }
 

@@ -188,7 +188,22 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                         let port = config.port;
                         let pos = config.pos;
                         let active = state.active;
+                        let alive = state.alive;
+                        let resolving = state.resolving;
                         let ips = state.ips;
+                        let active_addr = state
+                            .active_addr
+                            .map(|addr| format!(", active_addr: {addr}"))
+                            .unwrap_or_default();
+                        let peer_commit = state
+                            .peer_commit
+                            .map(|commit| {
+                                format!(
+                                    ", peer_commit: {}",
+                                    String::from_utf8_lossy(&commit).trim_end_matches('?')
+                                )
+                            })
+                            .unwrap_or_default();
                         let peer = config
                             .peer_fingerprint
                             .map(|fp| format!(", peer_fingerprint: {fp}"))
@@ -207,7 +222,7 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                             format!(", actions: {:?}", config.actions)
                         };
                         println!(
-                            "id {handle}: {host}:{port} ({pos}) active: {active}, ips: {ips:?}{peer}{enter_hook}{leave_hook}{actions}"
+                            "id {handle}: {host}:{port} ({pos}) active: {active}, alive: {alive}, resolving: {resolving}, ips: {ips:?}{active_addr}{peer_commit}{peer}{enter_hook}{leave_hook}{actions}"
                         );
                     }
                     break;
