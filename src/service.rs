@@ -5,7 +5,7 @@ use crate::{
     config::{Config, ConfigClient},
     connect::LanMouseConnection,
     crypto,
-    discovery::{self, Discovery, FingerprintCache, PrimaryCache},
+    discovery::{self, Discovery, FallbackProbe, FingerprintCache, PrimaryCache},
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
     listen::{LanMouseListener, ListenerCreationError},
@@ -89,6 +89,10 @@ pub struct Service {
     /// shared `PrimaryCache` (read by `LanMouseConnection`) from
     /// peer announcements.
     discovery: Discovery,
+    /// Low-rate UDP fingerprint fallback. Queried only for active
+    /// unresolved peers with no static or DNS candidates; stale mDNS
+    /// or last-success hints are allowed to be refreshed.
+    fallback_probe: FallbackProbe,
 }
 
 #[derive(Debug)]
@@ -160,6 +164,11 @@ impl Service {
             fingerprint_cache.clone(),
             public_key_fingerprint.clone(),
         );
+        let fallback_probe = FallbackProbe::new(
+            port,
+            public_key_fingerprint.clone(),
+            fingerprint_cache.clone(),
+        );
         let service = Self {
             config,
             capture,
@@ -182,6 +191,7 @@ impl Service {
             incoming_conns: Default::default(),
             next_trigger_handle: 0,
             discovery,
+            fallback_probe,
         };
         Ok(service)
     }
@@ -222,6 +232,11 @@ impl Service {
         // skip the immediate-fire; startup events will establish the
         // initial capture/emulation status first.
         health_tick.tick().await;
+        let mut fallback_probe_tick = tokio::time::interval(Duration::from_secs(30));
+        fallback_probe_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Queries are useful only after startup DNS/mDNS/last-success
+        // have had a chance to populate candidates.
+        fallback_probe_tick.tick().await;
 
         let mut terminal_error = None;
         loop {
@@ -234,6 +249,7 @@ impl Service {
                 _ = self.config.changed() => self.handle_config_change(),
                 _ = discovery_refresh_tick.tick() => self.discovery.refresh(),
                 _ = address_refresh_tick.tick() => self.refresh_active_hostname_candidates(),
+                _ = fallback_probe_tick.tick() => self.probe_unresolved_active_peers(),
                 _ = health_tick.tick() => {
                     if let Err(e) = self.health_check() {
                         log::error!("{e}");
@@ -257,6 +273,8 @@ impl Service {
         self.emulation.terminate().await;
         log::debug!("terminating dns resolver ...");
         self.resolver.terminate().await;
+        log::debug!("terminating fallback discovery probe ...");
+        self.fallback_probe.terminate();
 
         if let Some(e) = terminal_error {
             Err(e)
@@ -434,6 +452,7 @@ impl Service {
                 Ok(port) => {
                     self.port = port;
                     self.discovery.set_port(port);
+                    self.fallback_probe.set_dtls_port(port);
                     self.notify_frontend(FrontendEvent::PortChanged(port, None));
                 }
                 Err(e) => self
@@ -543,6 +562,27 @@ impl Service {
             if self.client_manager.active_addr(handle).is_none() {
                 self.resolve(handle);
             }
+        }
+    }
+
+    fn probe_unresolved_active_peers(&self) {
+        for handle in self.client_manager.active_clients() {
+            if self.client_manager.active_addr(handle).is_some() {
+                continue;
+            }
+            let Some(fingerprint) = self.client_manager.get_peer_fingerprint(handle) else {
+                continue;
+            };
+            let has_config_or_dns_candidates = self
+                .client_manager
+                .get_ips(handle)
+                .unwrap_or_default()
+                .into_iter()
+                .any(discovery::is_usable_candidate_ip);
+            if has_config_or_dns_candidates {
+                continue;
+            }
+            self.fallback_probe.query(&fingerprint);
         }
     }
 

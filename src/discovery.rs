@@ -30,7 +30,7 @@ use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
     fs, io,
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::Path,
     rc::Rc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -38,7 +38,11 @@ use std::{
 
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use serde::{Deserialize, Serialize};
-use tokio::task::{JoinHandle, spawn_local};
+use tokio::{
+    net::UdpSocket,
+    sync::mpsc::{UnboundedSender, unbounded_channel},
+    task::{JoinHandle, spawn_local},
+};
 
 use crate::crypto::normalize_fingerprint;
 
@@ -46,6 +50,8 @@ pub(crate) const SERVICE_TYPE: &str = "_lan-mouse._udp.local.";
 pub(crate) const TXT_PRIMARY_KEY: &str = "primary";
 pub(crate) const TXT_FINGERPRINT_KEY: &str = "fp";
 const LAST_SUCCESS_TTL: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+const FALLBACK_PROBE_PORT: u16 = 4243;
+const FALLBACK_PROBE_MAGIC: &str = "lan-mouse-fp-probe/1";
 
 /// Cross-platform: IP of the interface that owns the default route.
 ///
@@ -57,6 +63,77 @@ const LAST_SUCCESS_TTL: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 fn primary_ipv4() -> Option<Ipv4Addr> {
     let iface = netdev::get_default_interface().ok()?;
     iface.ipv4.first().map(|net| net.addr())
+}
+
+fn is_cgnat_ipv4(ip: Ipv4Addr) -> bool {
+    let [a, b, _, _] = ip.octets();
+    a == 100 && (64..=127).contains(&b)
+}
+
+fn is_lan_discovery_ipv4(ip: Ipv4Addr) -> bool {
+    !ip.is_loopback()
+        && !ip.is_link_local()
+        && !ip.is_unspecified()
+        && !ip.is_broadcast()
+        && !ip.is_multicast()
+        && !is_cgnat_ipv4(ip)
+}
+
+fn is_tailscale_interface_name(name: &str) -> bool {
+    name.to_ascii_lowercase().contains("tailscale")
+}
+
+fn local_lan_ipv4_addrs() -> Vec<IpAddr> {
+    let ifaces = match if_addrs::get_if_addrs() {
+        Ok(ifaces) => ifaces,
+        Err(e) => {
+            log::warn!("get_if_addrs failed for discovery address enumeration: {e}");
+            return Vec::new();
+        }
+    };
+    let mut addrs = ifaces
+        .into_iter()
+        .filter(|iface| !is_tailscale_interface_name(&iface.name))
+        .filter_map(|iface| match iface.addr {
+            if_addrs::IfAddr::V4(v4) if is_lan_discovery_ipv4(v4.ip) => Some(IpAddr::V4(v4.ip)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    addrs.sort();
+    addrs.dedup();
+    addrs
+}
+
+fn local_lan_broadcast_targets() -> Vec<SocketAddr> {
+    let ifaces = match if_addrs::get_if_addrs() {
+        Ok(ifaces) => ifaces,
+        Err(e) => {
+            log::warn!("get_if_addrs failed for fallback probe targets: {e}");
+            return vec![SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::BROADCAST),
+                FALLBACK_PROBE_PORT,
+            )];
+        }
+    };
+    let mut targets = ifaces
+        .into_iter()
+        .filter(|iface| !is_tailscale_interface_name(&iface.name))
+        .filter_map(|iface| match iface.addr {
+            if_addrs::IfAddr::V4(v4) if is_lan_discovery_ipv4(v4.ip) => v4
+                .broadcast
+                .filter(|ip| !ip.is_unspecified() && !ip.is_loopback())
+                .map(IpAddr::V4),
+            _ => None,
+        })
+        .map(|ip| SocketAddr::new(ip, FALLBACK_PROBE_PORT))
+        .collect::<Vec<_>>();
+    targets.push(SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::BROADCAST),
+        FALLBACK_PROBE_PORT,
+    ));
+    targets.sort();
+    targets.dedup();
+    targets
 }
 
 fn local_hostname() -> String {
@@ -124,6 +201,13 @@ pub(crate) fn is_usable_candidate_ip(ip: IpAddr) -> bool {
     }
 }
 
+fn is_usable_discovery_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => is_lan_discovery_ipv4(ip),
+        IpAddr::V6(_) => false,
+    }
+}
+
 /// Shared `peer_hostname -> primary_ipv4` map, populated by Discovery
 /// and read by the dialer (`connect_to_handle`). Owned by the dialer
 /// path so its references survive across discovery enable/disable
@@ -142,16 +226,16 @@ pub(crate) fn insert_fingerprint_candidate(
     cache: &FingerprintCache,
     fingerprint: &str,
     ip: IpAddr,
-) {
+) -> bool {
     let fingerprint = normalize_fingerprint(fingerprint);
-    if fingerprint.is_empty() || !is_usable_candidate_ip(ip) {
-        return;
+    if fingerprint.is_empty() || !is_usable_discovery_ip(ip) {
+        return false;
     }
     cache
         .borrow_mut()
         .entry(fingerprint)
         .or_default()
-        .insert(ip);
+        .insert(ip)
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -245,7 +329,7 @@ pub(crate) fn persist_last_success_candidate(
     } else {
         LastSuccessFile::default()
     };
-    if !is_usable_candidate_ip(ip) {
+    if !is_usable_discovery_ip(ip) {
         return Ok(());
     }
     let now = now_unix_secs()?;
@@ -282,6 +366,7 @@ pub(crate) struct Discovery {
     /// the current advertisement untouched while IP and port are
     /// unchanged.
     last_registered_primary: Option<Ipv4Addr>,
+    last_registered_addrs: Vec<IpAddr>,
     last_registered_port: Option<u16>,
     /// Shared cache (see [`PrimaryCache`]).
     primary_cache: PrimaryCache,
@@ -332,6 +417,7 @@ impl Discovery {
                     daemon: Some(daemon),
                     registered_fullname: None,
                     last_registered_primary: None,
+                    last_registered_addrs: Vec::new(),
                     last_registered_port: None,
                     primary_cache,
                     fingerprint_cache,
@@ -359,6 +445,7 @@ impl Discovery {
             daemon: None,
             registered_fullname: None,
             last_registered_primary: None,
+            last_registered_addrs: Vec::new(),
             last_registered_port: None,
             primary_cache,
             fingerprint_cache,
@@ -368,20 +455,30 @@ impl Discovery {
         }
     }
 
-    /// Register `_lan-mouse._udp.local.` with our hostname + primary
-    /// IP. Called on construction and again whenever the primary IP
-    /// or port may have changed.
+    /// Register `_lan-mouse._udp.local.` with all usable LAN IPv4
+    /// addresses. `primary=` stays a TXT hint for connection
+    /// preference, but the A records now cover every eligible local
+    /// interface so peers on a non-default subnet can still discover
+    /// this daemon.
     fn register(&mut self) {
         let Some(daemon) = self.daemon.as_ref() else {
             return;
         };
         let host = local_hostname();
         let host_record = format!("{host}.local.");
-        let primary = match primary_ipv4() {
+        let addrs = local_lan_ipv4_addrs();
+        let primary = match primary_ipv4()
+            .filter(|ip| addrs.contains(&IpAddr::V4(*ip)))
+            .or_else(|| {
+                addrs.iter().find_map(|ip| match ip {
+                    IpAddr::V4(ip) => Some(*ip),
+                    IpAddr::V6(_) => None,
+                })
+            }) {
             Some(ip) => ip,
             None => {
                 log::warn!(
-                    "mdns: no default-route interface; skipping registration (will retry on \
+                    "mdns: no usable LAN IPv4 addresses; skipping registration (will retry on \
                      interface change)"
                 );
                 return;
@@ -389,6 +486,7 @@ impl Discovery {
         };
         if self.registered_fullname.is_some()
             && self.last_registered_primary == Some(primary)
+            && self.last_registered_addrs == addrs
             && self.last_registered_port == Some(self.port)
         {
             return;
@@ -403,7 +501,7 @@ impl Discovery {
             SERVICE_TYPE,
             &host,
             &host_record,
-            IpAddr::V4(primary),
+            addrs.as_slice(),
             self.port,
             Some(props),
         ) {
@@ -423,16 +521,18 @@ impl Discovery {
         match daemon.register(info) {
             Ok(()) => {
                 log::info!(
-                    "mdns: registered {fullname} on {primary}:{port} (primary interface, fp={fp})",
+                    "mdns: registered {fullname} on {addrs:?}:{port} (primary={primary}, fp={fp})",
                     port = self.port,
                     fp = self.local_fingerprint.as_str(),
                 );
                 self.registered_fullname = Some(fullname);
                 self.last_registered_primary = Some(primary);
+                self.last_registered_addrs = addrs;
                 self.last_registered_port = Some(self.port);
             }
             Err(e) => {
                 self.last_registered_primary = None;
+                self.last_registered_addrs.clear();
                 self.last_registered_port = None;
                 log::warn!("mdns register failed: {e}");
             }
@@ -485,6 +585,7 @@ impl Discovery {
             let _ = daemon.shutdown();
         }
         self.last_registered_primary = None;
+        self.last_registered_addrs.clear();
         self.last_registered_port = None;
         if let Some(task) = self.browse_task.take() {
             task.abort();
@@ -520,7 +621,8 @@ fn start_browse(
     let local_fingerprint = normalize_fingerprint(&local_fingerprint);
     let local_name = normalize_mdns_name(&local_hostname());
     Some(spawn_local(async move {
-        let mut seen_services: HashMap<String, (IpAddr, u16, Option<String>)> = HashMap::new();
+        let mut seen_services: HashMap<String, (IpAddr, Vec<IpAddr>, u16, Option<String>)> =
+            HashMap::new();
         while let Ok(event) = receiver.recv_async().await {
             match event {
                 ServiceEvent::ServiceResolved(resolved) => {
@@ -545,12 +647,28 @@ fn start_browse(
                         log::debug!("mdns: ignoring our own service announcement {key}");
                         continue;
                     }
-                    let signature = (ip, resolved.get_port(), normalized_fingerprint.clone());
+                    let mut candidates = resolved
+                        .get_addresses()
+                        .iter()
+                        .map(|addr| addr.to_ip_addr())
+                        .filter(|ip| is_usable_discovery_ip(*ip))
+                        .collect::<Vec<_>>();
+                    if is_usable_discovery_ip(ip) {
+                        candidates.push(ip);
+                    }
+                    candidates.sort();
+                    candidates.dedup();
+                    let signature = (
+                        ip,
+                        candidates.clone(),
+                        resolved.get_port(),
+                        normalized_fingerprint.clone(),
+                    );
                     let first_or_changed = seen_services.get(&key) != Some(&signature);
                     if first_or_changed {
                         log::info!(
                             "mdns: peer instance={key} (target={target}) announces primary={ip} \
-                             (port={port}, fp={fingerprint:?})",
+                             candidates={candidates:?} (port={port}, fp={fingerprint:?})",
                             port = resolved.get_port(),
                         );
                     } else {
@@ -563,15 +681,7 @@ fn start_browse(
                     primary_cache.borrow_mut().insert(key, ip);
                     if let Some(fingerprint) = normalized_fingerprint {
                         if !fingerprint.is_empty() {
-                            let mut candidates = resolved
-                                .get_addresses()
-                                .iter()
-                                .map(|addr| addr.to_ip_addr())
-                                .filter(|ip| is_usable_candidate_ip(*ip))
-                                .collect::<HashSet<_>>();
-                            if is_usable_candidate_ip(ip) {
-                                candidates.insert(ip);
-                            }
+                            let candidates = candidates.into_iter().collect::<HashSet<_>>();
                             fingerprint_cache
                                 .borrow_mut()
                                 .insert(fingerprint, candidates);
@@ -592,6 +702,193 @@ fn start_browse(
             }
         }
     }))
+}
+
+enum FallbackProbeCommand {
+    Query { fingerprint: String },
+    SetDtlsPort(u16),
+}
+
+/// Very low-rate fallback for networks where mDNS browse misses a
+/// peer after DHCP or subnet changes. It does not run a scan loop of
+/// its own: callers enqueue a query only when an active peer has no
+/// active connection and no static/DNS candidates. Existing mDNS or
+/// last-success hints do not suppress the probe because they may be
+/// stale after DHCP changes.
+pub(crate) struct FallbackProbe {
+    tx: Option<UnboundedSender<FallbackProbeCommand>>,
+    task: Option<JoinHandle<()>>,
+}
+
+impl FallbackProbe {
+    pub(crate) fn new(
+        dtls_port: u16,
+        local_fingerprint: String,
+        fingerprint_cache: FingerprintCache,
+    ) -> Self {
+        let (tx, mut rx) = unbounded_channel::<FallbackProbeCommand>();
+        let local_fingerprint = normalize_fingerprint(&local_fingerprint);
+        let task = spawn_local(async move {
+            let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), FALLBACK_PROBE_PORT);
+            let socket = match UdpSocket::bind(bind_addr).await {
+                Ok(socket) => socket,
+                Err(e) => {
+                    log::warn!(
+                        "fallback discovery probe disabled: failed to bind {bind_addr}: {e}"
+                    );
+                    return;
+                }
+            };
+            if let Err(e) = socket.set_broadcast(true) {
+                log::warn!("fallback discovery probe cannot enable broadcast: {e}");
+            }
+            log::info!("fallback discovery probe listening on {bind_addr}");
+
+            let mut dtls_port = dtls_port;
+            let mut buf = [0u8; 512];
+            loop {
+                tokio::select! {
+                    command = rx.recv() => match command {
+                        Some(FallbackProbeCommand::Query { fingerprint }) => {
+                            send_fallback_probe(&socket, &local_fingerprint, &fingerprint).await;
+                        }
+                        Some(FallbackProbeCommand::SetDtlsPort(port)) => {
+                            dtls_port = port;
+                        }
+                        None => break,
+                    },
+                    result = socket.recv_from(&mut buf) => match result {
+                        Ok((len, src)) => {
+                            handle_fallback_probe_packet(
+                                &socket,
+                                &fingerprint_cache,
+                                &local_fingerprint,
+                                dtls_port,
+                                &buf[..len],
+                                src,
+                            ).await;
+                        }
+                        Err(e) => log::debug!("fallback discovery probe recv failed: {e}"),
+                    },
+                }
+            }
+        });
+        Self {
+            tx: Some(tx),
+            task: Some(task),
+        }
+    }
+
+    pub(crate) fn query(&self, fingerprint: &str) {
+        let Some(tx) = self.tx.as_ref() else {
+            return;
+        };
+        let fingerprint = normalize_fingerprint(fingerprint);
+        if fingerprint.is_empty() {
+            return;
+        }
+        let _ = tx.send(FallbackProbeCommand::Query { fingerprint });
+    }
+
+    pub(crate) fn set_dtls_port(&self, port: u16) {
+        if let Some(tx) = self.tx.as_ref() {
+            let _ = tx.send(FallbackProbeCommand::SetDtlsPort(port));
+        }
+    }
+
+    pub(crate) fn terminate(&mut self) {
+        self.tx.take();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+impl Drop for FallbackProbe {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+async fn send_fallback_probe(socket: &UdpSocket, local_fingerprint: &str, fingerprint: &str) {
+    let fingerprint = normalize_fingerprint(fingerprint);
+    if fingerprint.is_empty() || fingerprint == local_fingerprint {
+        return;
+    }
+    let payload = fallback_probe_request(local_fingerprint, &fingerprint);
+    let targets = local_lan_broadcast_targets();
+    for target in targets {
+        if let Err(e) = socket.send_to(payload.as_bytes(), target).await {
+            log::debug!("fallback discovery probe send to {target} failed: {e}");
+        }
+    }
+}
+
+async fn handle_fallback_probe_packet(
+    socket: &UdpSocket,
+    fingerprint_cache: &FingerprintCache,
+    local_fingerprint: &str,
+    dtls_port: u16,
+    payload: &[u8],
+    src: SocketAddr,
+) {
+    if !is_usable_discovery_ip(src.ip()) {
+        return;
+    }
+    let Ok(payload) = std::str::from_utf8(payload) else {
+        return;
+    };
+    if payload.lines().next() != Some(FALLBACK_PROBE_MAGIC) {
+        return;
+    }
+
+    if let Some(want) = fallback_probe_field(payload, "want") {
+        let want = normalize_fingerprint(want);
+        let from = fallback_probe_field(payload, "from").map(normalize_fingerprint);
+        if want == local_fingerprint && from.as_deref() != Some(local_fingerprint) {
+            let response = fallback_probe_response(local_fingerprint, dtls_port);
+            if let Err(e) = socket.send_to(response.as_bytes(), src).await {
+                log::debug!("fallback discovery probe response to {src} failed: {e}");
+            }
+        }
+        return;
+    }
+
+    if let Some(have) = fallback_probe_field(payload, "have") {
+        let have = normalize_fingerprint(have);
+        if have.is_empty() || have == local_fingerprint {
+            return;
+        }
+        if insert_fingerprint_candidate(fingerprint_cache, &have, src.ip()) {
+            log::info!(
+                "fallback discovery: peer {have} is reachable at {}",
+                src.ip()
+            );
+        }
+    }
+}
+
+fn fallback_probe_request(local_fingerprint: &str, wanted_fingerprint: &str) -> String {
+    format!(
+        "{FALLBACK_PROBE_MAGIC}\nfrom={}\nwant={}\n",
+        normalize_fingerprint(local_fingerprint),
+        normalize_fingerprint(wanted_fingerprint)
+    )
+}
+
+fn fallback_probe_response(local_fingerprint: &str, dtls_port: u16) -> String {
+    format!(
+        "{FALLBACK_PROBE_MAGIC}\nhave={}\nport={dtls_port}\n",
+        normalize_fingerprint(local_fingerprint)
+    )
+}
+
+fn fallback_probe_field<'a>(payload: &'a str, key: &str) -> Option<&'a str> {
+    let prefix = format!("{key}=");
+    payload
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .map(str::trim)
 }
 
 #[cfg(test)]
@@ -632,6 +929,35 @@ mod tests {
         let cache: FingerprintCache = Default::default();
         insert_fingerprint_candidate(&cache, "aa:bb", "fe80::1".parse().unwrap());
         assert!(cache.borrow().is_empty());
+    }
+
+    #[test]
+    fn skips_tailscale_cgnat_discovery_candidates() {
+        let cache: FingerprintCache = Default::default();
+        insert_fingerprint_candidate(&cache, "aa:bb", "100.76.35.84".parse().unwrap());
+        assert!(cache.borrow().is_empty());
+    }
+
+    #[test]
+    fn accepts_private_lan_discovery_candidates() {
+        let cache: FingerprintCache = Default::default();
+        insert_fingerprint_candidate(&cache, "aa:bb", "192.168.11.152".parse().unwrap());
+        let loaded = cache.borrow();
+        let ips = loaded.get("aa:bb").expect("fingerprint cache entry");
+        assert!(ips.contains(&"192.168.11.152".parse().unwrap()));
+    }
+
+    #[test]
+    fn fallback_probe_messages_are_field_parseable() {
+        let request = fallback_probe_request(" AA:BB ", " CC:DD ");
+        assert_eq!(request.lines().next(), Some(FALLBACK_PROBE_MAGIC));
+        assert_eq!(fallback_probe_field(&request, "from"), Some("aa:bb"));
+        assert_eq!(fallback_probe_field(&request, "want"), Some("cc:dd"));
+
+        let response = fallback_probe_response(" AA:BB ", 4242);
+        assert_eq!(response.lines().next(), Some(FALLBACK_PROBE_MAGIC));
+        assert_eq!(fallback_probe_field(&response, "have"), Some("aa:bb"));
+        assert_eq!(fallback_probe_field(&response, "port"), Some("4242"));
     }
 
     #[test]

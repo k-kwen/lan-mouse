@@ -46,6 +46,10 @@ activate_on_startup = true
 
 - Active client hostnames are resolved every 30 seconds.
 - If mDNS browse is delayed or lost, the OS resolver can still refresh `.local` / DNS IP candidates.
+- mDNS now advertises every usable LAN IPv4 address on the host, not only the default-route IP.
+- Tailscale/CGNAT `100.64.0.0/10`, loopback, multicast, and link-local addresses are excluded from dynamic discovery caches.
+- A lightweight fingerprint fallback probe listens on UDP `4243`.
+- The fallback probe only sends a small LAN broadcast when an active peer has no active connection and no static/DNS candidates; stale mDNS or last-success hints do not block refresh.
 - Hostname refresh only runs for active clients that do not currently have an active DTLS address.
 - If a peer has no usable address candidates, no DTLS connect task is spawned on edge crossing.
 - Capture is not armed while the peer is unresolved or in retry backoff, so the daemon stays light when the peer is offline.
@@ -86,6 +90,9 @@ Get-CimInstance Win32_Process -Filter "Name='lan-mouse.exe'" |
 Get-NetUDPEndpoint -LocalPort 4242 |
   Select-Object LocalAddress,LocalPort,OwningProcess
 
+Get-NetUDPEndpoint -LocalPort 4243 |
+  Select-Object LocalAddress,LocalPort,OwningProcess
+
 & "$env:USERPROFILE\Tools\lan-mouse\lan-mouse.exe" --version
 & "$env:USERPROFILE\Tools\lan-mouse\lan-mouse.exe" cli list
 & "$env:USERPROFILE\Tools\lan-mouse\lan-mouse.exe" discover --json --timeout-ms 10000
@@ -94,9 +101,27 @@ Get-NetUDPEndpoint -LocalPort 4242 |
 Expected:
 
 - UDP 4242 listens on the current Windows LAN IP.
+- UDP 4243 listens for the lightweight fingerprint fallback probe.
 - `cli list` includes `peer_fingerprint`, `alive`, `resolving`, and optionally `active_addr`.
-- If Mac is reachable through the same mDNS/LAN domain, `discover` shows the Mac fingerprint.
+- If Mac is reachable through the same mDNS/LAN domain, `discover` shows the Mac fingerprint and may list multiple LAN addresses.
 - If Mac is not reachable, edge crossing logs at most occasional `capture not armed` messages and does not create repeated DTLS work.
+- If mDNS is blocked but LAN broadcast works, the fallback probe can still cache the Mac IP by fingerprint.
+
+If Windows Firewall does not already have a program rule for `lan-mouse.exe`, allow the three UDP paths:
+
+```powershell
+New-NetFirewallRule -DisplayName "lan-mouse UDP 4242 DTLS" `
+  -Direction Inbound -Protocol UDP -LocalPort 4242 `
+  -Action Allow -Profile Any
+
+New-NetFirewallRule -DisplayName "lan-mouse UDP 4243 fallback discovery" `
+  -Direction Inbound -Protocol UDP -LocalPort 4243 `
+  -Action Allow -Profile Any
+
+New-NetFirewallRule -DisplayName "lan-mouse UDP 5353 mDNS" `
+  -Direction Inbound -Protocol UDP -LocalPort 5353 `
+  -Action Allow -Profile Any
+```
 
 ## Push For Mac
 
@@ -105,8 +130,8 @@ Only after checking unrelated local changes:
 ```powershell
 git status --short
 git diff --check
-git add src/service.rs lan-mouse-cli/src/lib.rs docs/260527-windows-ip-change-workplan.md docs/260527-mac-ip-change-workplan.md
-git commit -m "Harden dynamic peer address refresh"
+git add src/discovery.rs src/service.rs docs/260527-windows-ip-change-workplan.md docs/260527-mac-ip-change-workplan.md
+git commit -m "Improve dynamic LAN peer discovery"
 git push origin kwen-mdns-hooks
 ```
 
@@ -114,4 +139,4 @@ If `scripts/windows/README.md` or `scripts/windows/install-headless.ps1` are alr
 
 ## Hard Limit
 
-If Windows and Mac are on different VLANs/subnets and mDNS multicast does not cross that boundary, lan-mouse cannot discover across that boundary with LAN discovery alone. Fix the network path or intentionally choose another transport; do not hide that by adding stale static IPs.
+If Windows and Mac are on different VLANs/subnets and neither mDNS multicast nor same-LAN broadcast can cross that boundary, lan-mouse cannot discover across that boundary with LAN discovery alone. Fix the network path or intentionally choose another transport; do not hide that by adding stale static IPs.

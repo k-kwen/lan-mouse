@@ -16,9 +16,13 @@ Tailscale is diagnostic-only. Do not put `100.x.x.x` in config for this plan.
 When Windows is not discoverable, the Mac daemon must keep running but stay light:
 
 - Keep UDP 4242 listening and mDNS advertisement alive.
+- Advertise every usable Mac LAN IPv4 address through mDNS, not only the default-route address.
+- Exclude Tailscale/CGNAT `100.64.0.0/10`, loopback, multicast, and link-local addresses from dynamic discovery caches.
+- Keep UDP 4243 listening for the lightweight fingerprint fallback probe.
+- Send the fallback probe only when Windows has no active connection and no static/DNS candidates; stale mDNS or last-success hints do not block refresh.
 - Do not arm capture when the Windows peer has no address candidates.
 - Do not spawn DTLS connect tasks while unresolved or in retry backoff.
-- Retry through mDNS browse, last-success, and low-rate hostname refresh once candidates appear.
+- Retry through mDNS browse, fallback probe, last-success, and low-rate hostname refresh once candidates appear.
 - Repeated identical DNS failures should not fill the log.
 
 ## Fingerprints
@@ -182,25 +186,29 @@ launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/de.feschber.LanMo
 ```sh
 "$HOME/Tools/lan-mouse/lan-mouse" --version
 "$HOME/Tools/lan-mouse/lan-mouse" discover --json --timeout-ms 10000
+lsof -nP -iUDP:4242 -iUDP:4243
 tail -n 120 "$HOME/Library/Logs/lan-mouse/daemon.log"
 ```
 
 Expected:
 
-- Discovery shows `sangwha-KWEN` / `sangwha-KWEN.local`.
+- Discovery shows `sangwha-KWEN` / `sangwha-KWEN.local` if mDNS can cross the LAN path.
 - The advertised fingerprint equals `7c:af:...:59`.
+- The mDNS address list may include multiple Windows LAN addresses, but not Tailscale `100.x`.
+- If mDNS is blocked but LAN broadcast works, the fallback probe can still cache the Windows IP by fingerprint.
 - `Cmd + right edge` produces `client 0 acknowledged the connection!` or `client (0) connected`.
 - Windows -> Mac still works from the Windows left edge.
 - If Windows is not reachable, `Cmd + right edge` should not freeze or wait on repeated connection attempts; the log should show occasional `capture not armed` messages instead.
 
 ## Failure Branches
 
-If discovery only shows the Mac itself, Windows and Mac are not in the same mDNS/LAN domain. Check the Wi-Fi SSID/VLAN/subnet on both sides. The code cannot route across an isolated network boundary by itself.
+If discovery only shows the Mac itself, mDNS is still not crossing the LAN path. The new fallback probe may still recover if UDP broadcast reaches Windows on the same LAN. If both mDNS and broadcast are blocked, check the Wi-Fi SSID/VLAN/subnet on both sides. The code cannot route across an isolated network boundary by itself.
 
-If discovery works but DTLS times out, check Windows UDP 4242 and firewall:
+If discovery works but DTLS times out, check Windows UDP 4242, UDP 4243, UDP 5353, and firewall:
 
 ```powershell
 Get-NetUDPEndpoint -LocalPort 4242
+Get-NetUDPEndpoint -LocalPort 4243
 Get-NetFirewallRule -DisplayName "*lan-mouse*" |
   Select-Object DisplayName,Enabled,Direction,Action,Profile
 ```
