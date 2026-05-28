@@ -127,6 +127,8 @@ thread_local! {
     static EVENT_TX: RefCell<Option<Sender<(Position, CaptureEvent)>>> = const { RefCell::new(None) };
     /// position of barrier entry
     static ENTRY_POINT: Cell<(i32, i32)> = const { Cell::new((0, 0)) };
+    /// last mouse position used to emit relative motion
+    static LAST_SENT_POS: Cell<Option<(i32, i32)>> = const { Cell::new(None) };
     /// previous mouse position
     static PREV_POS: Cell<Option<(i32, i32)>> = const { Cell::new(None) };
     /// displays and generation counter
@@ -267,7 +269,7 @@ fn start_routine(
             match msg.wParam.0 {
                 x if x == RequestType::Exit as usize => break,
                 x if x == RequestType::Release as usize => {
-                    ACTIVE_CLIENT.take();
+                    clear_active_capture();
                 }
                 x if x == RequestType::ClientUpdate as usize => {
                     let requests = {
@@ -346,6 +348,7 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
         display_util::clamp_to_display_bounds(displays, prev_pos, curr_pos)
     });
     ENTRY_POINT.replace(entry_point);
+    LAST_SENT_POS.replace(Some(entry_point));
 
     /* notify main thread */
     log::debug!("ENTERED @ {prev_pos:?} -> {curr_pos:?}");
@@ -421,11 +424,16 @@ unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
 }
 
 fn force_release_after_keyboard_queue_error(pos: Position) {
-    let was_active = ACTIVE_CLIENT.take().is_some();
+    let was_active = clear_active_capture().is_some();
     flush_held_modifiers_to_os();
     if was_active {
         dispatch_auto_release(pos);
     }
+}
+
+fn clear_active_capture() -> Option<Position> {
+    LAST_SENT_POS.take();
+    ACTIVE_CLIENT.take()
 }
 
 fn dispatch_auto_release(pos: Position) {
@@ -536,7 +544,7 @@ unsafe extern "system" fn window_proc(
         match wparam.0 as u32 {
             WTS_SESSION_LOCK => {
                 HOST_LOCKED.set(true);
-                if let Some(pos) = ACTIVE_CLIENT.take() {
+                if let Some(pos) = clear_active_capture() {
                     log::info!("host session locked mid-capture; releasing");
                     let _ = try_send_event(pos, CaptureEvent::AutoRelease);
                 } else {
@@ -616,7 +624,7 @@ fn update_clients(request: ClientUpdate) {
         ClientUpdate::Destroy(pos) => {
             if let Some(active_pos) = ACTIVE_CLIENT.get() {
                 if pos == active_pos {
-                    let _ = ACTIVE_CLIENT.take();
+                    clear_active_capture();
                 }
             }
             CLIENTS.with_borrow_mut(|clients| clients.remove(&pos));
@@ -702,9 +710,9 @@ fn to_mouse_event(wparam: WPARAM, lparam: LPARAM) -> Option<PointerEvent> {
         }),
         WPARAM(p) if p == WM_MOUSEMOVE as usize => {
             let (x, y) = (mouse_low_level.pt.x, mouse_low_level.pt.y);
-            let (ex, ey) = ENTRY_POINT.get();
-            let (dx, dy) = (x - ex, y - ey);
-            ENTRY_POINT.replace((x, y));
+            let (lx, ly) = LAST_SENT_POS.get().unwrap_or((x, y));
+            LAST_SENT_POS.replace(Some((x, y)));
+            let (dx, dy) = (x - lx, y - ly);
             let (dx, dy) = (dx as f64, dy as f64);
             Some(PointerEvent::Motion { time: 0, dx, dy })
         }
