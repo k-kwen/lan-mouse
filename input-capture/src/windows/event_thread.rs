@@ -127,8 +127,6 @@ thread_local! {
     static EVENT_TX: RefCell<Option<Sender<(Position, CaptureEvent)>>> = const { RefCell::new(None) };
     /// position of barrier entry
     static ENTRY_POINT: Cell<(i32, i32)> = const { Cell::new((0, 0)) };
-    /// last mouse position used to emit cross-axis relative motion
-    static LAST_SENT_POS: Cell<Option<(i32, i32)>> = const { Cell::new(None) };
     /// previous mouse position
     static PREV_POS: Cell<Option<(i32, i32)>> = const { Cell::new(None) };
     /// displays and generation counter
@@ -269,7 +267,7 @@ fn start_routine(
             match msg.wParam.0 {
                 x if x == RequestType::Exit as usize => break,
                 x if x == RequestType::Release as usize => {
-                    clear_active_capture();
+                    ACTIVE_CLIENT.take();
                 }
                 x if x == RequestType::ClientUpdate as usize => {
                     let requests = {
@@ -348,7 +346,6 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
         display_util::clamp_to_display_bounds(displays, prev_pos, curr_pos)
     });
     ENTRY_POINT.replace(entry_point);
-    LAST_SENT_POS.replace(Some(entry_point));
 
     /* notify main thread */
     log::debug!("ENTERED @ {prev_pos:?} -> {curr_pos:?}");
@@ -377,7 +374,7 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
     };
 
     /* convert to lan-mouse event */
-    let Some(pointer_event) = to_mouse_event(pos, wparam, lparam) else {
+    let Some(pointer_event) = to_mouse_event(wparam, lparam) else {
         return LRESULT(1);
     };
 
@@ -424,16 +421,11 @@ unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
 }
 
 fn force_release_after_keyboard_queue_error(pos: Position) {
-    let was_active = clear_active_capture().is_some();
+    let was_active = ACTIVE_CLIENT.take().is_some();
     flush_held_modifiers_to_os();
     if was_active {
         dispatch_auto_release(pos);
     }
-}
-
-fn clear_active_capture() -> Option<Position> {
-    LAST_SENT_POS.take();
-    ACTIVE_CLIENT.take()
 }
 
 fn dispatch_auto_release(pos: Position) {
@@ -544,7 +536,7 @@ unsafe extern "system" fn window_proc(
         match wparam.0 as u32 {
             WTS_SESSION_LOCK => {
                 HOST_LOCKED.set(true);
-                if let Some(pos) = clear_active_capture() {
+                if let Some(pos) = ACTIVE_CLIENT.take() {
                     log::info!("host session locked mid-capture; releasing");
                     let _ = try_send_event(pos, CaptureEvent::AutoRelease);
                 } else {
@@ -624,7 +616,7 @@ fn update_clients(request: ClientUpdate) {
         ClientUpdate::Destroy(pos) => {
             if let Some(active_pos) = ACTIVE_CLIENT.get() {
                 if pos == active_pos {
-                    clear_active_capture();
+                    let _ = ACTIVE_CLIENT.take();
                 }
             }
             CLIENTS.with_borrow_mut(|clients| clients.remove(&pos));
@@ -675,7 +667,7 @@ fn to_key_event(wparam: WPARAM, lparam: LPARAM) -> Option<KeyboardEvent> {
     }
 }
 
-fn to_mouse_event(pos: Position, wparam: WPARAM, lparam: LPARAM) -> Option<PointerEvent> {
+fn to_mouse_event(wparam: WPARAM, lparam: LPARAM) -> Option<PointerEvent> {
     let mouse_low_level: MSLLHOOKSTRUCT = unsafe { *(lparam.0 as *const MSLLHOOKSTRUCT) };
     match wparam {
         WPARAM(p) if p == WM_LBUTTONDOWN as usize => Some(PointerEvent::Button {
@@ -711,12 +703,7 @@ fn to_mouse_event(pos: Position, wparam: WPARAM, lparam: LPARAM) -> Option<Point
         WPARAM(p) if p == WM_MOUSEMOVE as usize => {
             let (x, y) = (mouse_low_level.pt.x, mouse_low_level.pt.y);
             let (ex, ey) = ENTRY_POINT.get();
-            let (lx, ly) = LAST_SENT_POS.get().unwrap_or((x, y));
-            LAST_SENT_POS.replace(Some((x, y)));
-            let (dx, dy) = match pos {
-                Position::Left | Position::Right => (x - ex, y - ly),
-                Position::Top | Position::Bottom => (x - lx, y - ey),
-            };
+            let (dx, dy) = (x - ex, y - ey);
             let (dx, dy) = (dx as f64, dy as f64);
             Some(PointerEvent::Motion { time: 0, dx, dy })
         }
