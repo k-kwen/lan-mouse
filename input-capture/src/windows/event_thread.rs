@@ -704,6 +704,7 @@ fn to_mouse_event(wparam: WPARAM, lparam: LPARAM) -> Option<PointerEvent> {
             let (x, y) = (mouse_low_level.pt.x, mouse_low_level.pt.y);
             let (ex, ey) = ENTRY_POINT.get();
             let (dx, dy) = (x - ex, y - ey);
+            ENTRY_POINT.replace((x, y));
             let (dx, dy) = (dx as f64, dy as f64);
             Some(PointerEvent::Motion { time: 0, dx, dy })
         }
