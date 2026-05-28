@@ -127,7 +127,7 @@ thread_local! {
     static EVENT_TX: RefCell<Option<Sender<(Position, CaptureEvent)>>> = const { RefCell::new(None) };
     /// position of barrier entry
     static ENTRY_POINT: Cell<(i32, i32)> = const { Cell::new((0, 0)) };
-    /// last mouse position used to emit relative motion
+    /// last mouse position used to emit cross-axis relative motion
     static LAST_SENT_POS: Cell<Option<(i32, i32)>> = const { Cell::new(None) };
     /// previous mouse position
     static PREV_POS: Cell<Option<(i32, i32)>> = const { Cell::new(None) };
@@ -377,7 +377,7 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
     };
 
     /* convert to lan-mouse event */
-    let Some(pointer_event) = to_mouse_event(wparam, lparam) else {
+    let Some(pointer_event) = to_mouse_event(pos, wparam, lparam) else {
         return LRESULT(1);
     };
 
@@ -675,7 +675,7 @@ fn to_key_event(wparam: WPARAM, lparam: LPARAM) -> Option<KeyboardEvent> {
     }
 }
 
-fn to_mouse_event(wparam: WPARAM, lparam: LPARAM) -> Option<PointerEvent> {
+fn to_mouse_event(pos: Position, wparam: WPARAM, lparam: LPARAM) -> Option<PointerEvent> {
     let mouse_low_level: MSLLHOOKSTRUCT = unsafe { *(lparam.0 as *const MSLLHOOKSTRUCT) };
     match wparam {
         WPARAM(p) if p == WM_LBUTTONDOWN as usize => Some(PointerEvent::Button {
@@ -710,9 +710,13 @@ fn to_mouse_event(wparam: WPARAM, lparam: LPARAM) -> Option<PointerEvent> {
         }),
         WPARAM(p) if p == WM_MOUSEMOVE as usize => {
             let (x, y) = (mouse_low_level.pt.x, mouse_low_level.pt.y);
+            let (ex, ey) = ENTRY_POINT.get();
             let (lx, ly) = LAST_SENT_POS.get().unwrap_or((x, y));
             LAST_SENT_POS.replace(Some((x, y)));
-            let (dx, dy) = (x - lx, y - ly);
+            let (dx, dy) = match pos {
+                Position::Left | Position::Right => (x - ex, y - ly),
+                Position::Top | Position::Bottom => (x - lx, y - ey),
+            };
             let (dx, dy) = (dx as f64, dy as f64);
             Some(PointerEvent::Motion { time: 0, dx, dy })
         }
