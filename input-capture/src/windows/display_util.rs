@@ -86,10 +86,16 @@ pub(crate) fn clamp_to_display_bounds(
     point: (i32, i32),
 ) -> (i32, i32) {
     /* find display where movement came from */
-    let display = display_regions
+    let Some(display) = display_regions
         .iter()
         .find(|&d| is_within_dp_region(prev_point, d))
-        .unwrap();
+    else {
+        // prev_point isn't inside any enumerated display — e.g. a stale
+        // display cache racing a layout change. Fall back to the
+        // unclamped point instead of panicking in the hook thread.
+        log::warn!("clamp_to_display_bounds: no display contains {prev_point:?}; skipping clamp");
+        return point;
+    };
 
     /* clamp to bounds (inclusive) */
     let (x, y) = point;
