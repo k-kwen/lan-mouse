@@ -570,6 +570,14 @@ fn to_mouse_event(wparam: WPARAM, lparam: LPARAM) -> Option<PointerEvent> {
         WPARAM(p) if p == WM_MOUSEMOVE as usize => {
             let (x, y) = (mouse_low_level.pt.x, mouse_low_level.pt.y);
             let (ex, ey) = ENTRY_POINT.get();
+            // Events are swallowed (mouse_proc returns LRESULT(1)) while
+            // captured, so the OS cursor stays frozen at the entry point and
+            // each WM_MOUSEMOVE reports pt = entry + this event's raw delta.
+            // The per-event delta is therefore pt - ENTRY_POINT with
+            // ENTRY_POINT held FIXED. Do NOT advance ENTRY_POINT per event:
+            // that emits delta-of-deltas and breaks motion. The real
+            // negative-coordinate bug lives in the Enter-warp path
+            // (Windows display_bounds/origin), not here.
             let (dx, dy) = (x - ex, y - ey);
             let (dx, dy) = (dx as f64, dy as f64);
             Some(PointerEvent::Motion { time: 0, dx, dy })
