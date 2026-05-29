@@ -185,6 +185,7 @@ extern "C" {
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     fn AXIsProcessTrusted() -> bool;
+    fn CGEventPost(tap: u32, event: *const c_void);
 }
 
 // Text Input Source (TIS) bindings for direct IME switching. macOS rejects
@@ -323,136 +324,29 @@ unsafe extern "C" {
     ) -> CFStringRef;
     fn CFArrayGetCount(arr: CFArrayRef) -> CFIndex;
     fn CFArrayGetValueAtIndex(arr: CFArrayRef, idx: CFIndex) -> *const c_void;
-    fn CFDictionaryGetValue(dict: *const c_void, key: *const c_void) -> *const c_void;
-    fn CFNumberGetValue(num: *const c_void, the_type: i64, value_ptr: *mut c_void) -> bool;
 }
 
-#[link(name = "CoreGraphics", kind = "framework")]
-unsafe extern "C" {
-    fn CGWindowListCopyWindowInfo(option: u32, relative_to: u32) -> CFArrayRef;
-    static kCGWindowOwnerName: CFStringRef;
-    static kCGWindowLayer: CFStringRef;
-}
-
-const K_CF_NUMBER_SINT32_TYPE: i64 = 3;
-const K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY: u32 = 1;
-const K_CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS: u32 = 1 << 4;
-
-/// Returns the owner-name of the topmost on-screen regular-app window
-/// (layer == 0). Used to route mouse4/mouse5 differently depending on
-/// the frontmost app (browsers/Finder keep back-forward semantics).
-fn frontmost_window_owner_name() -> Option<String> {
-    unsafe {
-        let arr = CGWindowListCopyWindowInfo(
-            K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY | K_CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS,
-            0,
-        );
-        if arr.is_null() {
-            return None;
-        }
-        let mut result: Option<String> = None;
-        let count = CFArrayGetCount(arr);
-        for i in 0..count {
-            let dict = CFArrayGetValueAtIndex(arr, i);
-            if dict.is_null() {
-                continue;
-            }
-            let layer_val = CFDictionaryGetValue(dict, kCGWindowLayer as *const c_void);
-            if layer_val.is_null() {
-                continue;
-            }
-            let mut layer: i32 = 0;
-            if !CFNumberGetValue(
-                layer_val,
-                K_CF_NUMBER_SINT32_TYPE,
-                &mut layer as *mut i32 as *mut c_void,
-            ) {
-                continue;
-            }
-            if layer != 0 {
-                continue;
-            }
-            let name_val = CFDictionaryGetValue(dict, kCGWindowOwnerName as *const c_void);
-            if name_val.is_null() {
-                continue;
-            }
-            let mut buf = [0u8; 256];
-            if !CFStringGetCString(
-                name_val as CFStringRef,
-                buf.as_mut_ptr(),
-                buf.len() as CFIndex,
-                K_CF_STRING_ENCODING_UTF8,
-            ) {
-                continue;
-            }
-            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-            result = std::str::from_utf8(&buf[..end]).ok().map(|s| s.to_string());
-            break;
-        }
-        CFRelease(arr);
-        result
+fn canonical_side_button(button: u32) -> Option<u32> {
+    match button {
+        BTN_BACK | 3 => Some(BTN_BACK),
+        BTN_FORWARD | 4 => Some(BTN_FORWARD),
+        _ => None,
     }
 }
 
-/// How a mouse4/mouse5 press should be routed based on the frontmost app.
-enum BackForwardRoute {
-    /// Forward the press as a standard OtherMouse button 3/4 event — the app
-    /// handles it natively (browsers).
-    Passthrough,
-    /// Synthesize ⌘+[ / ⌘+] — the app exposes navigation only via that menu
-    /// shortcut, not via raw side-buttons (Finder).
-    CmdBracket,
-    /// Trigger Mission Control / Show Desktop via a trusted path
-    /// (`open -a` / AppleScript System Events).
-    SystemShortcut,
-}
-
-fn back_forward_route(name: Option<&str>) -> BackForwardRoute {
-    match name {
-        Some("Google Chrome" | "Safari") => BackForwardRoute::Passthrough,
-        Some("Finder") => BackForwardRoute::CmdBracket,
-        _ => BackForwardRoute::SystemShortcut,
-    }
-}
-
-/// Synthesizes a ⌘+<key> chord. Used for Finder back/forward (⌘+[ and ⌘+]).
-/// App menu shortcuts are accepted from synthetic CGEvents (only *system*
-/// shortcut triggers like F9/F11 get rejected).
-///
-/// Wraps the chord with explicit FlagsChanged events so the system sees a
-/// clean ⌘-press / ⌘-release boundary — without the final release event,
-/// macOS leaves the modifier stuck, and the next left click is interpreted
-/// as ⌘+Click (no window focus, action happens in place, looks like a
-/// drag-without-focus bug).
-fn send_cmd_key(event_source: CGEventSource, mac_keycode: u16, current_mods: XMods) {
-    let mods_with_cmd = to_cgevent_flags(current_mods) | CGEventFlags::CGEventFlagCommand;
-    let mods_restored = to_cgevent_flags(current_mods);
-
-    // 1. Tell the system ⌘ is now down.
-    if let Ok(e) = CGEvent::new(event_source.clone()) {
-        e.set_type(CGEventType::FlagsChanged);
-        e.set_flags(mods_with_cmd);
-        e.post(CGEventTapLocation::HID);
-    }
-    // 2. Key down.
-    if let Ok(e) = CGEvent::new_keyboard_event(event_source.clone(), mac_keycode, true) {
-        e.set_flags(mods_with_cmd);
-        e.post(CGEventTapLocation::HID);
+fn side_button_name(button: u32) -> &'static str {
+    if button == BTN_BACK {
+        "back"
     } else {
-        log::warn!("send_cmd_key: keydown creation failed");
+        "forward"
     }
-    // 3. Key up.
-    if let Ok(e) = CGEvent::new_keyboard_event(event_source.clone(), mac_keycode, false) {
-        e.set_flags(mods_with_cmd);
-        e.post(CGEventTapLocation::HID);
-    } else {
-        log::warn!("send_cmd_key: keyup creation failed");
-    }
-    // 4. Release ⌘ — restore the modifier state lan-mouse was tracking.
-    if let Ok(e) = CGEvent::new(event_source) {
-        e.set_type(CGEventType::FlagsChanged);
-        e.set_flags(mods_restored);
-        e.post(CGEventTapLocation::HID);
+}
+
+fn side_button_cg_number(button: u32) -> Option<i64> {
+    match canonical_side_button(button) {
+        Some(BTN_BACK) => Some(3),
+        Some(BTN_FORWARD) => Some(4),
+        _ => None,
     }
 }
 
@@ -648,17 +542,9 @@ fn applescript_api() -> Option<&'static AppleScriptApi> {
 
 // ---- NSEvent media-key synthesis via Objective-C runtime + dlsym ----------
 //
-// macOS routes hardware volume / mute / brightness / play-pause keys as
-// `NSSystemDefined` events (type 14, subtype 8 — "auxiliary control
-// buttons"), NOT as regular keyboard events. Posting CGKeyDown/KeyUp at the
-// matching keycode (kVK_VolumeUp etc.) does NOT change volume or pop the
-// OSD — the system shortcut handler ignores it.
-//
-// The well-known synthesis path is `+[NSEvent
-// otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:
-// subtype:data1:data2:]` followed by `-CGEvent` and CGEventPost. We reach
-// that via objc_msgSend resolved at runtime (same pattern as NSAppleScript
-// above), avoiding a new build dependency.
+// macOS routes hardware volume / mute keys as NSSystemDefined events, not as
+// regular keyboard events. Posting CGKeyDown/CGKeyUp at kVK_VolumeUp etc. does
+// not change volume, so synthesize the same event shape used by hardware keys.
 
 const NSEVENT_TYPE_SYSTEM_DEFINED: u64 = 14;
 const NSEVENT_SUBTYPE_AUX_CONTROL: i64 = 8;
@@ -690,11 +576,6 @@ type FnNSEventOther = unsafe extern "C" fn(
 
 type FnNSEventCGEvent = unsafe extern "C" fn(self_: ObjcId, sel: ObjcSel) -> *const c_void;
 
-#[link(name = "ApplicationServices", kind = "framework")]
-unsafe extern "C" {
-    fn CGEventPost(tap: u32, event: *const c_void);
-}
-
 struct MediaKeyApi {
     nsevent_class: ObjcClass,
     other_event_sel: ObjcSel,
@@ -711,7 +592,6 @@ static MEDIA_KEY_API: std::sync::OnceLock<Option<MediaKeyApi>> = std::sync::Once
 fn media_key_api() -> Option<&'static MediaKeyApi> {
     MEDIA_KEY_API
         .get_or_init(|| unsafe {
-            // Need AppKit loaded for NSEvent.
             let _appkit =
                 dlopen(c"/System/Library/Frameworks/AppKit.framework/AppKit".as_ptr(), RTLD_LAZY);
             let get_class = dlsym(RTLD_DEFAULT, c"objc_getClass".as_ptr());
@@ -746,17 +626,7 @@ fn media_key_api() -> Option<&'static MediaKeyApi> {
         .as_ref()
 }
 
-/// Synthesizes a media key press (keydown + keyup) via NSSystemDefined event.
-/// `key_type` is one of NX_KEYTYPE_SOUND_UP / SOUND_DOWN / MUTE / PLAY etc.
-/// This produces the system OSD that real hardware volume keys produce.
-///
-/// `fine_step` adds Shift+Option NSEvent modifier bits — equivalent to a
-/// physical Shift+Option+VolumeKey on a Mac keyboard, which macOS interprets
-/// as a 1/4-step (so the volume changes in 1/64 increments instead of 1/16).
-/// `false` matches a plain hardware volume-key press.
 fn post_media_key(key_type: u32, fine_step: bool) {
-    // NSEventModifierFlag bits — only the higher-order ones are NSEvent
-    // modifier flags; the lower 0xa00/0xb00 bits are the media-key magic.
     const NSEVENT_MOD_SHIFT: u64 = 1 << 17;
     const NSEVENT_MOD_OPTION: u64 = 1 << 19;
     let fine_mods: u64 = if fine_step {
@@ -769,8 +639,6 @@ fn post_media_key(key_type: u32, fine_step: bool) {
         log::warn!("post_media_key: API unavailable");
         return;
     };
-    // Borrow the NSAppleScript-side autorelease pool helpers so the events
-    // we synthesize get released instead of accumulating per call.
     let pool_api = applescript_api();
     unsafe {
         let pool = pool_api.map(|p| {
@@ -784,7 +652,6 @@ fn post_media_key(key_type: u32, fine_step: bool) {
 
         for &down in &[true, false] {
             let flags: u64 = (if down { 0xa00 } else { 0xb00 }) | fine_mods;
-            // data1 encodes (keyType in upper 16 bits) | (down/up flag in lower 16).
             let state_nibble: i64 = if down { 0xa } else { 0xb };
             let data1: i64 = ((key_type as i64) << 16) | (state_nibble << 8);
 
@@ -1021,6 +888,28 @@ fn toggle_korean_input_source() {
     }
 }
 
+fn reselect_current_input_source(reason: &str) {
+    let Some(api) = tis_api() else {
+        log::warn!("TIS: API unavailable while refreshing input source ({reason})");
+        return;
+    };
+    unsafe {
+        let current = (api.copy_current)();
+        if current.is_null() {
+            log::warn!("TIS: failed to get current input source while refreshing ({reason})");
+            return;
+        }
+        let id = input_source_id(api, current).unwrap_or_else(|| "<unknown>".to_string());
+        let status = (api.select)(current);
+        CFRelease(current);
+        if status == 0 {
+            log::info!("TIS: refreshed current input source {id} ({reason})");
+        } else {
+            log::warn!("TIS: refresh {id} failed ({reason}, OSStatus {status})");
+        }
+    }
+}
+
 fn key_event(event_source: CGEventSource, key: u16, state: u8, modifiers: XMods) {
     let event = match CGEvent::new_keyboard_event(event_source, key, state != 0) {
         Ok(e) => e,
@@ -1084,6 +973,42 @@ fn get_display_bounds(display: CGDirectDisplayID) -> (CGFloat, CGFloat, CGFloat,
     }
 }
 
+fn valid_display_bounds(
+    display: CGDirectDisplayID,
+) -> Option<(CGFloat, CGFloat, CGFloat, CGFloat)> {
+    let (min_x, min_y, max_x, max_y) = get_display_bounds(display);
+    if max_x <= min_x || max_y <= min_y {
+        log::warn!(
+            "ignoring invalid display bounds for display {display}: ({min_x}, {min_y})-({max_x}, {max_y})"
+        );
+        return None;
+    }
+    Some((min_x, min_y, max_x, max_y))
+}
+
+/// Top-left corner of the union of all active displays, in the global
+/// Quartz coordinate system anchored at the MAIN display's top-left.
+/// NEGATIVE on an axis when a display sits left of / above the main
+/// one. Pairs with the size returned by `display_bounds` so a 0-based
+/// virtual point can be mapped back to an absolute warp target.
+fn display_union_origin() -> (CGFloat, CGFloat) {
+    let Ok(displays) = CGDisplay::active_displays() else {
+        return (0., 0.);
+    };
+    let mut xmin = f64::INFINITY;
+    let mut ymin = f64::INFINITY;
+    for id in displays {
+        let bounds = CGDisplay::new(id).bounds();
+        xmin = xmin.min(bounds.origin.x);
+        ymin = ymin.min(bounds.origin.y);
+    }
+    if xmin.is_finite() && ymin.is_finite() {
+        (xmin, ymin)
+    } else {
+        (0., 0.)
+    }
+}
+
 fn clamp_to_screen_space(
     current_x: CGFloat,
     current_y: CGFloat,
@@ -1109,7 +1034,11 @@ fn clamp_to_screen_space(
     let new_y = current_y + dy;
 
     let final_display = get_display_at_point(new_x, new_y).unwrap_or(current_display);
-    let (min_x, min_y, max_x, max_y) = get_display_bounds(final_display);
+    let Some((min_x, min_y, max_x, max_y)) =
+        valid_display_bounds(final_display).or_else(|| valid_display_bounds(current_display))
+    else {
+        return (current_x, current_y);
+    };
 
     (
         new_x.clamp(min_x, max_x - 1.),
@@ -1174,68 +1103,35 @@ impl Emulation for MacOSEmulation {
                         button,
                         state,
                     } => {
-                        // Route mouse4 (BTN_BACK) / mouse5 (BTN_FORWARD) to
-                        // F9 (Mission Control) / F11 (Show Desktop) unless the
-                        // frontmost app is a browser/Finder, where back-forward
-                        // is the natural behavior.
-                        if matches!(button, BTN_BACK | BTN_FORWARD) {
+                        // Route side buttons to F9/F11 unconditionally. Accept
+                        // both lan-mouse's evdev BTN_BACK/FORWARD constants and
+                        // raw macOS OtherMouse button numbers 3/4 so older or
+                        // platform-specific peers do not fall through as normal
+                        // back/forward mouse events.
+                        if let Some(side_button) = canonical_side_button(button) {
                             if state == 1 {
-                                let owner = frontmost_window_owner_name();
-                                match back_forward_route(owner.as_deref()) {
-                                    BackForwardRoute::Passthrough => {
-                                        // fall through to existing OtherMouseDown logic
-                                    }
-                                    BackForwardRoute::CmdBracket => {
-                                        let bracket_key: u16 = if button == BTN_BACK {
-                                            0x21 // "["
-                                        } else {
-                                            0x1E // "]"
-                                        };
-                                        log::debug!(
-                                            "mouse{} -> ⌘+{} (frontmost: {:?})",
-                                            if button == BTN_BACK { 4 } else { 5 },
-                                            if button == BTN_BACK { "[" } else { "]" },
-                                            owner
-                                        );
-                                        send_cmd_key(
-                                            self.event_source.clone(),
-                                            bracket_key,
-                                            self.modifier_state.get(),
-                                        );
-                                        self.synth_keyed_buttons.insert(button);
-                                        return Ok(());
-                                    }
-                                    BackForwardRoute::SystemShortcut => {
-                                        log::debug!(
-                                            "mouse{} -> {} (frontmost: {:?})",
-                                            if button == BTN_BACK { 4 } else { 5 },
-                                            if button == BTN_BACK {
-                                                "Mission Control"
-                                            } else {
-                                                "Show Desktop"
-                                            },
-                                            owner
-                                        );
-                                        if button == BTN_BACK {
-                                            trigger_mission_control();
-                                        } else {
-                                            trigger_show_desktop();
-                                        }
-                                        self.synth_keyed_buttons.insert(button);
-                                        return Ok(());
-                                    }
+                                if side_button == BTN_BACK {
+                                    log::info!(
+                                        "side mouse button {} (raw={button}) -> F9 / Mission Control",
+                                        side_button_name(side_button)
+                                    );
+                                    trigger_mission_control();
+                                } else {
+                                    log::info!(
+                                        "side mouse button {} (raw={button}) -> F11 / Show Desktop",
+                                        side_button_name(side_button)
+                                    );
+                                    trigger_show_desktop();
                                 }
-                            } else if self.synth_keyed_buttons.remove(&button) {
+                                self.synth_keyed_buttons.insert(side_button);
+                                return Ok(());
+                            } else if self.synth_keyed_buttons.remove(&side_button) {
                                 // matching release for a synth-routed press
                                 return Ok(());
                             }
                         }
                         // button number for OtherMouse events (3 = back, 4 = forward, etc.)
-                        let cg_button_number: Option<i64> = match button {
-                            BTN_BACK => Some(3),
-                            BTN_FORWARD => Some(4),
-                            _ => None,
-                        };
+                        let cg_button_number = side_button_cg_number(button);
                         let (event_type, mouse_button) = match (button, state) {
                             (BTN_LEFT, 1) => (CGEventType::LeftMouseDown, CGMouseButton::Left),
                             (BTN_LEFT, 0) => (CGEventType::LeftMouseUp, CGMouseButton::Left),
@@ -1410,11 +1306,8 @@ impl Emulation for MacOSEmulation {
                             }
                             return Ok(());
                         }
-                        // Media keys: macOS expects these as NSSystemDefined
-                        // events, not regular keyboard events. A KeyDown at
-                        // kVK_VolumeUp etc. would do nothing.
                         113 => {
-                            // evdev KEY_MUTE — single state, no fine grain
+                            // evdev KEY_MUTE
                             if state == 1 {
                                 log::debug!("Mute key -> NSSystemDefined MUTE");
                                 post_media_key(NX_KEYTYPE_MUTE, false);
@@ -1422,7 +1315,7 @@ impl Emulation for MacOSEmulation {
                             return Ok(());
                         }
                         114 => {
-                            // evdev KEY_VOLUMEDOWN — fine step (¼ of native step)
+                            // evdev KEY_VOLUMEDOWN, with fine-step modifiers.
                             if state == 1 {
                                 log::debug!("VolumeDown -> NSSystemDefined SOUND_DOWN (fine)");
                                 post_media_key(NX_KEYTYPE_SOUND_DOWN, true);
@@ -1430,7 +1323,7 @@ impl Emulation for MacOSEmulation {
                             return Ok(());
                         }
                         115 => {
-                            // evdev KEY_VOLUMEUP — fine step (¼ of native step)
+                            // evdev KEY_VOLUMEUP, with fine-step modifiers.
                             if state == 1 {
                                 log::debug!("VolumeUp -> NSSystemDefined SOUND_UP (fine)");
                                 post_media_key(NX_KEYTYPE_SOUND_UP, true);
@@ -1472,9 +1365,14 @@ impl Emulation for MacOSEmulation {
         Ok(())
     }
 
-    async fn create(&mut self, _handle: EmulationHandle) {}
+    async fn create(&mut self, _handle: EmulationHandle) {
+        self.last_ime_toggle = None;
+        reselect_current_input_source("remote enter");
+    }
 
-    async fn destroy(&mut self, _handle: EmulationHandle) {}
+    async fn destroy(&mut self, _handle: EmulationHandle) {
+        self.last_ime_toggle = None;
+    }
 
     async fn terminate(&mut self) {}
 
@@ -1501,9 +1399,20 @@ impl Emulation for MacOSEmulation {
     }
 
     async fn warp_cursor(&mut self, x: i32, y: i32) -> Result<(), EmulationError> {
+        // `x`/`y` arrive as 0-based virtual coordinates (the receiver
+        // scales the host's normalized fraction against the size from
+        // `display_bounds`, the display-union extent). The global Quartz
+        // coordinate system is anchored at the MAIN display's top-left,
+        // so a display left of / above main occupies negative coords.
+        // Offset by the union origin so the point lands on the true
+        // union edge rather than main's edge — a no-op (0, 0) for a
+        // single-display / main-at-origin layout, the fix for a left/top
+        // secondary. Mirrors the input-capture origin handling and the
+        // Windows backend.
+        let (ox, oy) = display_union_origin();
         let pt = CGPoint {
-            x: x as CGFloat,
-            y: y as CGFloat,
+            x: x as CGFloat + ox,
+            y: y as CGFloat + oy,
         };
         // CGDisplay::warp_mouse_cursor_position is a global Quartz
         // call; it doesn't matter which CGDisplay receiver we use.

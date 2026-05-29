@@ -1,6 +1,10 @@
 use crate::client::ClientManager;
 use crate::config::local_commit;
-use crate::discovery::{PrimaryCache, normalize_mdns_name};
+use crate::crypto::{generate_fingerprint, normalize_fingerprint};
+use crate::discovery::{
+    self, FingerprintCache, PrimaryCache, insert_fingerprint_candidate, is_usable_candidate_ip,
+    normalize_mdns_name,
+};
 use lan_mouse_ipc::{ClientHandle, DEFAULT_PORT};
 use lan_mouse_proto::{MAX_EVENT_SIZE, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
@@ -10,6 +14,7 @@ use std::{
     hash::{DefaultHasher, Hash, Hasher},
     io,
     net::{IpAddr, SocketAddr},
+    path::PathBuf,
     rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
@@ -21,6 +26,7 @@ use tokio::{
     task::{JoinSet, spawn_local},
 };
 use webrtc_dtls::{
+    Error as DtlsError,
     config::{Config, ExtendedMasterSecretType},
     conn::DTLSConn,
     crypto::Certificate,
@@ -97,9 +103,55 @@ fn record_retry_failure(
     entry.backoff = (next * 2).min(MAX_RETRY_BACKOFF);
 }
 
+fn discovery_hint_for(
+    client_manager: &ClientManager,
+    handle: ClientHandle,
+    primary_hints: &PrimaryCache,
+    fingerprint_hints: &FingerprintCache,
+) -> Option<IpAddr> {
+    client_manager
+        .get_hostname(handle)
+        .and_then(|h| {
+            let key = normalize_mdns_name(&h);
+            primary_hints.borrow().get(&key).copied()
+        })
+        .or_else(|| {
+            client_manager.get_peer_fingerprint(handle).and_then(|fp| {
+                let key = normalize_fingerprint(&fp);
+                fingerprint_hints.borrow().get(&key).and_then(|candidates| {
+                    candidates
+                        .iter()
+                        .copied()
+                        .find(|ip| is_usable_candidate_ip(*ip))
+                })
+            })
+        })
+}
+
+fn discovery_candidates_for(
+    client_manager: &ClientManager,
+    handle: ClientHandle,
+    fingerprint_hints: &FingerprintCache,
+) -> HashSet<IpAddr> {
+    client_manager
+        .get_peer_fingerprint(handle)
+        .and_then(|fp| {
+            let key = normalize_fingerprint(&fp);
+            fingerprint_hints.borrow().get(&key).map(|candidates| {
+                candidates
+                    .iter()
+                    .copied()
+                    .filter(|ip| is_usable_candidate_ip(*ip))
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+}
+
 async fn connect(
     addr: SocketAddr,
     cert: Certificate,
+    expected_fingerprint: Option<String>,
 ) -> Result<(Arc<dyn Conn + Sync + Send>, SocketAddr), (SocketAddr, LanMouseConnectionError)> {
     log::info!("connecting to {addr} ...");
     let conn = Arc::new(
@@ -108,10 +160,31 @@ async fn connect(
             .map_err(|e| (addr, e.into()))?,
     );
     conn.connect(addr).await.map_err(|e| (addr, e.into()))?;
+    let verify_peer_certificate = expected_fingerprint.map(|expected| {
+        Arc::new(
+            move |certificates: &[Vec<u8>],
+                  _chains: &[rustls::pki_types::CertificateDer<'static>]| {
+                let Some(cert) = certificates.first() else {
+                    return Err(DtlsError::Other(
+                        "peer did not present a certificate".to_owned(),
+                    ));
+                };
+                let actual = generate_fingerprint(cert);
+                if actual == expected {
+                    Ok(())
+                } else {
+                    Err(DtlsError::Other(format!(
+                        "peer fingerprint mismatch: expected {expected}, got {actual}"
+                    )))
+                }
+            },
+        ) as _
+    });
     let config = Config {
         certificates: vec![cert],
         server_name: "ignored".to_owned(),
         insecure_skip_verify: true,
+        verify_peer_certificate,
         extended_master_secret: ExtendedMasterSecretType::Require,
         ..Default::default()
     };
@@ -136,6 +209,7 @@ async fn connect_any(
     addrs: &[SocketAddr],
     preferred: Option<SocketAddr>,
     cert: Certificate,
+    expected_fingerprint: Option<String>,
 ) -> Result<(Arc<dyn Conn + Send + Sync>, SocketAddr), LanMouseConnectionError> {
     let mut joinset = JoinSet::new();
     if let Some(p) = preferred {
@@ -144,7 +218,7 @@ async fn connect_any(
         // before the others even start — the dialer biases toward
         // the OS-preferred interface (Mac service order, Linux
         // default route) without relying on RTT racing alone.
-        joinset.spawn_local(connect(p, cert.clone()));
+        joinset.spawn_local(connect(p, cert.clone(), expected_fingerprint.clone()));
         let head_start = tokio::time::sleep(PREFERRED_ADDR_HEAD_START);
         tokio::pin!(head_start);
         loop {
@@ -162,7 +236,7 @@ async fn connect_any(
             // already racing; don't dial the same socket twice
             continue;
         }
-        joinset.spawn_local(connect(addr, cert.clone()));
+        joinset.spawn_local(connect(addr, cert.clone(), expected_fingerprint.clone()));
     }
     loop {
         match joinset.join_next().await {
@@ -190,6 +264,10 @@ pub(crate) struct LanMouseConnection {
     /// to bias which address gets the handshake head-start. Empty
     /// when discovery is disabled or no peer hint has arrived yet.
     primary_hints: PrimaryCache,
+    /// Map of `peer_fingerprint -> candidate_ips` populated by mDNS.
+    /// This makes the configured certificate identity the preferred
+    /// discovery key when available; hostname is only the fallback.
+    fingerprint_hints: FingerprintCache,
     /// Per-handle retry gate. Suppresses connect spawns when the
     /// previous attempt failed and nothing new is available to dial,
     /// so an offline peer doesn't trigger a fresh `connect_to_handle`
@@ -197,6 +275,11 @@ pub(crate) struct LanMouseConnection {
     /// event. Cleared on successful connect; bypassed automatically
     /// when the candidate-set signature changes.
     retry_state: Rc<RefCell<HashMap<ClientHandle, RetryState>>>,
+    /// Persistent last-success cache path. Successful DTLS handshakes
+    /// write the peer fingerprint -> IP candidate here so a daemon
+    /// restart keeps dynamic-IP recovery warm even before fresh mDNS
+    /// browse events arrive.
+    last_success_cache_path: Option<PathBuf>,
 }
 
 impl LanMouseConnection {
@@ -204,6 +287,8 @@ impl LanMouseConnection {
         cert: Certificate,
         client_manager: ClientManager,
         primary_hints: PrimaryCache,
+        fingerprint_hints: FingerprintCache,
+        last_success_cache_path: Option<PathBuf>,
     ) -> Self {
         let (recv_tx, recv_rx) = channel();
         Self {
@@ -215,7 +300,9 @@ impl LanMouseConnection {
             recv_tx,
             ping_response: Default::default(),
             primary_hints,
+            fingerprint_hints,
             retry_state: Default::default(),
+            last_success_cache_path,
         }
     }
 
@@ -230,32 +317,52 @@ impl LanMouseConnection {
     ) -> Result<(), LanMouseConnectionError> {
         let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
         let buf = &buf[..len];
-        if let Some(addr) = self.client_manager.active_addr(handle) {
-            let conn = {
-                let conns = self.conns.lock().await;
-                conns.get(&addr).cloned()
-            };
-            if let Some(conn) = conn {
-                if !self.client_manager.alive(handle) {
-                    return Err(LanMouseConnectionError::TargetEmulationDisabled);
-                }
-                match conn.send(buf).await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        log::warn!("client {handle} failed to send: {e}");
-                        disconnect(&self.client_manager, handle, addr, &self.conns).await;
-                    }
-                }
-                log::trace!("{event} >->->->->- {addr}");
-                return Ok(());
+        if let Some((addr, conn)) = self.conn_for_handle(handle).await {
+            if !self.client_manager.alive(handle) {
+                return Err(LanMouseConnectionError::TargetEmulationDisabled);
             }
+            match conn.send(buf).await {
+                Ok(_) => {}
+                Err(e) => {
+                    log::warn!("client {handle} failed to send: {e}");
+                    disconnect(&self.client_manager, handle, addr, &conn, &self.conns).await;
+                }
+            }
+            log::trace!("{event} >->->->->- {addr}");
+            return Ok(());
         }
 
-        // check if we are already trying to connect
+        self.ensure_connected(handle).await;
+        Err(LanMouseConnectionError::NotConnected)
+    }
+
+    async fn conn_for_handle(
+        &self,
+        handle: ClientHandle,
+    ) -> Option<(SocketAddr, Arc<dyn Conn + Send + Sync>)> {
+        let addr = self.client_manager.active_addr(handle)?;
+        let conn = {
+            let conns = self.conns.lock().await;
+            conns.get(&addr).cloned()
+        }?;
+        Some((addr, conn))
+    }
+
+    pub(crate) async fn is_connected(&self, handle: ClientHandle) -> bool {
+        self.conn_for_handle(handle).await.is_some()
+    }
+
+    pub(crate) async fn is_ready(&self, handle: ClientHandle) -> bool {
+        self.conn_for_handle(handle).await.is_some() && self.client_manager.alive(handle)
+    }
+
+    pub(crate) async fn ensure_connected(&self, handle: ClientHandle) -> bool {
+        if self.is_connected(handle).await {
+            return true;
+        }
         let mut connecting = self.connecting.lock().await;
         if !connecting.contains(&handle) && self.should_attempt(handle) {
             connecting.insert(handle);
-            // connect in the background
             spawn_local(connect_to_handle(
                 self.client_manager.clone(),
                 self.cert.clone(),
@@ -265,10 +372,12 @@ impl LanMouseConnection {
                 self.recv_tx.clone(),
                 self.ping_response.clone(),
                 self.primary_hints.clone(),
+                self.fingerprint_hints.clone(),
                 self.retry_state.clone(),
+                self.last_success_cache_path.clone(),
             ));
         }
-        Err(LanMouseConnectionError::NotConnected)
+        false
     }
 
     /// Decide whether to spawn another `connect_to_handle` for `handle`.
@@ -281,11 +390,19 @@ impl LanMouseConnection {
     /// Otherwise returns false; the caller treats this as "still in
     /// cooldown, keep returning NotConnected silently."
     fn should_attempt(&self, handle: ClientHandle) -> bool {
-        let ips = self.client_manager.get_ips(handle).unwrap_or_default();
-        let primary = self.client_manager.get_hostname(handle).and_then(|h| {
-            let key = normalize_mdns_name(&h);
-            self.primary_hints.borrow().get(&key).copied()
-        });
+        let mut ips = self.client_manager.get_ips(handle).unwrap_or_default();
+        ips.retain(|ip| is_usable_candidate_ip(*ip));
+        ips.extend(discovery_candidates_for(
+            &self.client_manager,
+            handle,
+            &self.fingerprint_hints,
+        ));
+        let primary = discovery_hint_for(
+            &self.client_manager,
+            handle,
+            &self.primary_hints,
+            &self.fingerprint_hints,
+        );
         let sig = signature_of(&ips, primary);
         let mut state = self.retry_state.borrow_mut();
         match state.get_mut(&handle) {
@@ -311,11 +428,19 @@ async fn connect_to_handle(
     tx: Sender<(ClientHandle, ProtoEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
     primary_hints: PrimaryCache,
+    fingerprint_hints: FingerprintCache,
     retry_state: Rc<RefCell<HashMap<ClientHandle, RetryState>>>,
+    last_success_cache_path: Option<PathBuf>,
 ) -> Result<(), LanMouseConnectionError> {
     log::info!("client {handle} connecting ...");
     // sending did not work, figure out active conn.
-    if let Some(ips_set) = client_manager.get_ips(handle) {
+    if let Some(mut ips_set) = client_manager.get_ips(handle) {
+        ips_set.retain(|ip| is_usable_candidate_ip(*ip));
+        ips_set.extend(discovery_candidates_for(
+            &client_manager,
+            handle,
+            &fingerprint_hints,
+        ));
         let port = client_manager.get_port(handle).unwrap_or(DEFAULT_PORT);
         let addrs = ips_set
             .iter()
@@ -327,11 +452,12 @@ async fn connect_to_handle(
         // it alone for ~200ms before joining the rest of the list,
         // so a healthy primary almost always wins regardless of
         // raw RTT ordering.
-        let primary_ip = client_manager.get_hostname(handle).and_then(|h| {
-            let key = normalize_mdns_name(&h);
-            primary_hints.borrow().get(&key).copied()
-        });
+        let primary_ip =
+            discovery_hint_for(&client_manager, handle, &primary_hints, &fingerprint_hints);
         let preferred = primary_ip.map(|ip| SocketAddr::new(ip, port));
+        let expected_fingerprint = client_manager
+            .get_peer_fingerprint(handle)
+            .map(|fp| normalize_fingerprint(&fp));
         log::info!("client ({handle}) connecting ... (ips: {addrs:?}, preferred: {preferred:?})");
         if addrs.is_empty() && preferred.is_none() {
             // Nothing to dial. Bump backoff and bail without spawning
@@ -342,7 +468,7 @@ async fn connect_to_handle(
             connecting.lock().await.remove(&handle);
             return Err(LanMouseConnectionError::NotConnected);
         }
-        let res = connect_any(&addrs, preferred, cert).await;
+        let res = connect_any(&addrs, preferred, cert, expected_fingerprint.clone()).await;
         let (conn, addr) = match res {
             Ok(c) => c,
             Err(e) => {
@@ -352,7 +478,18 @@ async fn connect_to_handle(
             }
         };
         log::info!("client ({handle}) connected @ {addr}");
+        if let Some(fingerprint) = expected_fingerprint.as_deref() {
+            insert_fingerprint_candidate(&fingerprint_hints, fingerprint, addr.ip());
+            if let Some(path) = last_success_cache_path.as_deref() {
+                if let Err(e) =
+                    discovery::persist_last_success_candidate(path, fingerprint, addr.ip())
+                {
+                    log::warn!("failed to persist last-success candidate to {path:?}: {e}");
+                }
+            }
+        }
         client_manager.set_active_addr(handle, Some(addr));
+        client_manager.set_alive(handle, false);
         conns.lock().await.insert(addr, conn.clone());
         connecting.lock().await.remove(&handle);
         retry_state.borrow_mut().remove(&handle);
@@ -382,6 +519,7 @@ async fn connect_to_handle(
             conns,
             tx,
             ping_response.clone(),
+            expected_fingerprint,
         ));
         return Ok(());
     }
@@ -425,9 +563,21 @@ async fn receive_loop(
     conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
     tx: Sender<(ClientHandle, ProtoEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    expected_fingerprint: Option<String>,
 ) {
     let mut buf = [0u8; MAX_EVENT_SIZE];
     while conn.recv(&mut buf).await.is_ok() {
+        let current_fingerprint = client_manager
+            .get_peer_fingerprint(handle)
+            .map(|fp| normalize_fingerprint(&fp));
+        if current_fingerprint != expected_fingerprint {
+            log::warn!(
+                "closing stale session for client {handle} @ {addr}: expected fingerprint changed \
+                 from {expected_fingerprint:?} to {current_fingerprint:?}"
+            );
+            let _ = conn.close().await;
+            break;
+        }
         match buf.try_into() {
             Ok(event) => {
                 log::trace!("{addr} <==<==<== {event}");
@@ -451,19 +601,38 @@ async fn receive_loop(
         }
     }
     log::warn!("recv error");
-    disconnect(&client_manager, handle, addr, &conns).await;
+    disconnect(&client_manager, handle, addr, &conn, &conns).await;
 }
 
 async fn disconnect(
     client_manager: &ClientManager,
     handle: ClientHandle,
     addr: SocketAddr,
+    conn: &Arc<dyn Conn + Send + Sync>,
     conns: &Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>,
 ) {
     log::warn!("client ({handle}) @ {addr} connection closed");
-    conns.lock().await.remove(&addr);
-    client_manager.set_active_addr(handle, None);
-    client_manager.set_peer_commit(handle, None);
+    let removed_current = {
+        let mut conns = conns.lock().await;
+        if conns
+            .get(&addr)
+            .is_some_and(|current| Arc::ptr_eq(current, conn))
+        {
+            conns.remove(&addr);
+            true
+        } else {
+            false
+        }
+    };
+    if client_manager.active_addr(handle) == Some(addr) {
+        client_manager.set_active_addr(handle, None);
+        client_manager.set_alive(handle, false);
+        client_manager.set_peer_commit(handle, None);
+    } else if !removed_current {
+        log::debug!(
+            "stale connection for client ({handle}) @ {addr} closed after a newer session was installed"
+        );
+    }
     let active: Vec<SocketAddr> = conns.lock().await.keys().copied().collect();
     log::info!("active connections: {active:?}");
 }

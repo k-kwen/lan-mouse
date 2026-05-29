@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
+use std::ops::BitOrAssign;
 use std::ptr::addr_of_mut;
 
 use std::default::Default;
@@ -20,6 +21,10 @@ use windows::Win32::System::RemoteDesktop::{
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::core::{PCWSTR, w};
 
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
+    KEYEVENTF_SCANCODE, SendInput,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DispatchMessageW, EDD_GET_DEVICE_INTERFACE_NAME, GetMessageW,
     HOOKPROC, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, PostThreadMessageW,
@@ -134,6 +139,12 @@ thread_local! {
     /// would happily forward motion to the peer while the lock screen
     /// consumes keyboard events, leaving a half-broken state.
     static HOST_LOCKED: Cell<bool> = const { Cell::new(false) };
+    /// Modifier keys whose down events were swallowed locally and
+    /// forwarded to the peer while capture was active. If the hook
+    /// queue overflows before their matching key-up reaches the main
+    /// capture task, we synthesize local key-ups before passing
+    /// events back to Windows.
+    static HELD_MODIFIERS: RefCell<HashSet<Linux>> = RefCell::new(HashSet::new());
 }
 
 fn get_msg() -> Option<MSG> {
@@ -339,7 +350,12 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
     /* notify main thread */
     log::debug!("ENTERED @ {prev_pos:?} -> {curr_pos:?}");
     let active = ACTIVE_CLIENT.get().expect("active client");
-    blocking_send_event(active, CaptureEvent::Begin { cursor: None });
+    blocking_send_event(
+        active,
+        CaptureEvent::Begin {
+            cursor: Some(entry_point),
+        },
+    );
 
     ret
 }
@@ -364,7 +380,10 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
 
     /* notify mainthread (drop events if sending too fast) */
     if let Err(e) = try_send_event(pos, CaptureEvent::Input(Event::Pointer(pointer_event))) {
-        log::warn!("e: {e}");
+        match e {
+            TrySendError::Full(_) => log::debug!("dropping pointer event: capture queue full"),
+            TrySendError::Closed(_) => log::warn!("dropping pointer event: capture queue closed"),
+        }
     }
 
     /* don't pass event to applications */
@@ -383,11 +402,125 @@ unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
     };
 
     if let Err(e) = try_send_event(client, CaptureEvent::Input(Event::Keyboard(key_event))) {
-        log::warn!("e: {e}");
+        match e {
+            TrySendError::Full(_) => {
+                log::warn!("keyboard queue full; forcing capture release and local modifier flush");
+                force_release_after_keyboard_queue_error(client);
+            }
+            TrySendError::Closed(_) => {
+                log::warn!("keyboard queue closed; releasing local capture state");
+                force_release_after_keyboard_queue_error(client);
+            }
+        }
+        return CallNextHookEx(None, ncode, wparam, lparam);
     }
+    track_forwarded_modifier(key_event);
 
     /* don't pass event to applications */
     LRESULT(1)
+}
+
+fn force_release_after_keyboard_queue_error(pos: Position) {
+    let was_active = ACTIVE_CLIENT.take().is_some();
+    flush_held_modifiers_to_os();
+    if was_active {
+        dispatch_auto_release(pos);
+    }
+}
+
+fn dispatch_auto_release(pos: Position) {
+    let event = (pos, CaptureEvent::AutoRelease);
+    EVENT_TX.with_borrow(|tx| {
+        let Some(tx) = tx.as_ref() else {
+            return;
+        };
+        match tx.try_send(event) {
+            Ok(()) => {}
+            Err(TrySendError::Full(event)) => {
+                let tx = tx.clone();
+                thread::spawn(move || {
+                    if let Err(e) = tx.blocking_send(event) {
+                        log::warn!("failed to queue forced capture release: {e}");
+                    }
+                });
+            }
+            Err(TrySendError::Closed(_)) => {
+                log::warn!("failed to queue forced capture release: queue closed");
+            }
+        }
+    });
+}
+
+fn track_forwarded_modifier(event: KeyboardEvent) {
+    let KeyboardEvent::Key { key, state, .. } = event else {
+        return;
+    };
+    let Ok(key) = Linux::try_from(key) else {
+        return;
+    };
+    if !is_modifier(key) {
+        return;
+    }
+    HELD_MODIFIERS.with_borrow_mut(|held| match state {
+        1 => {
+            held.insert(key);
+        }
+        0 => {
+            held.remove(&key);
+        }
+        _ => {}
+    });
+}
+
+fn flush_held_modifiers_to_os() {
+    let modifiers = HELD_MODIFIERS.with_borrow_mut(|held| held.drain().collect::<Vec<_>>());
+    for key in modifiers {
+        send_key_up_to_os(key);
+    }
+}
+
+fn is_modifier(key: Linux) -> bool {
+    matches!(
+        key,
+        Linux::KeyLeftShift
+            | Linux::KeyRightShift
+            | Linux::KeyLeftCtrl
+            | Linux::KeyRightCtrl
+            | Linux::KeyLeftAlt
+            | Linux::KeyRightalt
+            | Linux::KeyLeftMeta
+            | Linux::KeyRightmeta
+    )
+}
+
+fn send_key_up_to_os(key: Linux) {
+    let Ok(windows_key) = scancode::Windows::try_from(key) else {
+        return;
+    };
+    let scancode = windows_key as u16;
+    let extended = scancode > 0xff;
+    let mut flags = KEYEVENTF_SCANCODE;
+    if extended {
+        flags.bitor_assign(KEYEVENTF_EXTENDEDKEY);
+    }
+    flags.bitor_assign(KEYEVENTF_KEYUP);
+    let input = INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: Default::default(),
+                wScan: scancode & 0xff,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    unsafe {
+        if SendInput(&[input], std::mem::size_of::<INPUT>() as i32) == 0 {
+            log::warn!("failed to synthesize local modifier key-up for {key:?}");
+        }
+    }
 }
 
 unsafe extern "system" fn window_proc(

@@ -30,19 +30,21 @@ pub(crate) struct Capture {
 }
 
 pub(crate) enum ICaptureEvent {
-    /// a client was entered
+    /// The local cursor crossed a capture boundary.
     CaptureBegin(CaptureHandle),
     /// capture disabled
     CaptureDisabled,
     /// capture disabled
     CaptureEnabled,
-    /// A (new) client was entered.
+    /// A remote client acknowledged capture and is ready for input.
     /// In contrast to [`ICaptureEvent::CaptureBegin`] this
-    /// event is only triggered when the capture was
-    /// explicitly released in the meantime by
-    /// either the remote client leaving its device region,
-    /// a new device entering the screen or the release bind.
+    /// event is only triggered after the transport handoff completed.
     ClientEntered(u64),
+    /// The local cursor reclaimed input from a remote client
+    /// (peer sent a `Leave` — either they released their own
+    /// outbound capture or are taking over). Mirror of
+    /// [`ICaptureEvent::ClientEntered`] for the leave side.
+    ClientLeft(u64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -203,20 +205,42 @@ impl CaptureTask {
             .any(|&(_, p, t)| p == pos && t == CaptureType::Default)
     }
 
-    fn get_pos(&self, handle: CaptureHandle) -> Position {
+    fn get_capture(&self, handle: CaptureHandle) -> Option<(Position, CaptureType)> {
         self.captures
             .iter()
             .find(|(h, ..)| *h == handle)
-            .expect("no such capture")
-            .1
+            .map(|(_, pos, capture_type)| (*pos, *capture_type))
     }
 
-    fn get_type(&self, handle: CaptureHandle) -> CaptureType {
-        self.captures
-            .iter()
-            .find(|(h, ..)| *h == handle)
-            .expect("no such capture")
-            .2
+    fn has_capture(&self, handle: CaptureHandle) -> bool {
+        self.captures.iter().any(|(h, ..)| *h == handle)
+    }
+
+    async fn ensure_ready_for_begin(&self, handle: CaptureHandle) -> bool {
+        const TIMEOUT: Duration = Duration::from_millis(1200);
+        const POLL: Duration = Duration::from_millis(25);
+
+        if self.conn.is_ready(handle).await {
+            return true;
+        }
+        self.conn.ensure_connected(handle).await;
+
+        log::info!("client {handle} is not ready yet; waiting for initial connection");
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(POLL) => {}
+                _ = self.cancellation_token.cancelled() => return false,
+            }
+
+            if self.conn.is_ready(handle).await {
+                return true;
+            }
+
+            if Instant::now() >= deadline {
+                return self.conn.is_ready(handle).await;
+            }
+        }
     }
 
     async fn run(mut self) {
@@ -347,11 +371,26 @@ impl CaptureTask {
                         }
                     }
 
+                    if !self.has_capture(handle) {
+                        log::debug!("ignoring connection event for unknown capture {handle}");
+                        continue;
+                    }
+
                     match event {
-                        // connection acknowlegded => set state to Sending
+                        // Connection acknowledged => input handoff completed.
+                        // Only now notify the service layer so side effects such
+                        // as monitor input switching do not run before the peer
+                        // is actually ready to receive cursor/input events.
                         ProtoEvent::Ack(_) => {
                             log::info!("client {handle} acknowledged the connection!");
+                            let was_waiting_for_this_client = self.state == State::WaitingForAck
+                                && self.active_client == Some(handle);
                             self.state = State::Sending;
+                            if was_waiting_for_this_client {
+                                self.event_tx
+                                    .send(ICaptureEvent::ClientEntered(handle))
+                                    .expect("channel closed");
+                            }
                         }
                         // Peer sent Leave — either they just released
                         // their own outbound capture, or they're
@@ -367,13 +406,19 @@ impl CaptureTask {
                         ProtoEvent::Leave(_) => {
                             log::info!("releasing capture: left remote client device region");
                             self.release_capture_handover(capture).await?;
+                            self.event_tx
+                                .send(ICaptureEvent::ClientLeft(handle))
+                                .expect("channel closed");
                         },
                         // Peer reported its display geometry — cache it
                         // so the wall-press model has a real upper
                         // clamp on virtual_pos for this position.
                         ProtoEvent::Bounds { width, height } => {
-                            let pos = self.get_pos(handle);
-                            capture.set_peer_bounds(pos, width, height);
+                            if let Some((pos, _)) = self.get_capture(handle) {
+                                capture.set_peer_bounds(pos, width, height);
+                            } else {
+                                log::debug!("ignoring Bounds from removed capture {handle}");
+                            }
                         }
                         _ => {}
                     }
@@ -386,13 +431,16 @@ impl CaptureTask {
                         capture.create(h, p).await?;
                     }
                     CaptureRequest::Destroy(h) => {
-                        let pos = self.get_pos(h);
-                        self.remove_capture(h);
-                        capture.destroy(h).await?;
-                        // Drop the cached geometry — the next client
-                        // added at this position may report different
-                        // bounds.
-                        capture.clear_peer_bounds(pos);
+                        if let Some((pos, _)) = self.get_capture(h) {
+                            self.remove_capture(h);
+                            capture.destroy(h).await?;
+                            // Drop the cached geometry — the next client
+                            // added at this position may report different
+                            // bounds.
+                            capture.clear_peer_bounds(pos);
+                        } else {
+                            log::debug!("ignoring destroy for removed capture {h}");
+                        }
                     }
                     CaptureRequest::SetReleaseBind(bind) => {
                         self.release_bind.borrow_mut().clone_from(&bind);
@@ -416,6 +464,11 @@ impl CaptureTask {
         let (handle, event) = event;
         log::trace!("({handle}): {event:?}");
 
+        let Some((capture_pos, capture_type)) = self.get_capture(handle) else {
+            log::debug!("ignoring event for removed capture {handle}: {event:?}");
+            return Ok(());
+        };
+
         if capture.keys_pressed(&self.release_bind.borrow()) {
             log::info!("releasing capture: release-bind pressed");
             return self.release_capture(capture).await;
@@ -437,10 +490,10 @@ impl CaptureTask {
         }
 
         // enter only capture (for incoming connections)
-        if self.get_type(handle) == CaptureType::EnterOnly {
+        if capture_type == CaptureType::EnterOnly {
             // if there is no active outgoing connection at the current capture,
             // we release the capture
-            if !self.is_default_capture_at(self.get_pos(handle)) {
+            if !self.is_default_capture_at(capture_pos) {
                 log::info!("releasing capture: no active client at this position");
                 capture.release().await?;
             }
@@ -448,16 +501,20 @@ impl CaptureTask {
             return Ok(());
         }
 
+        if matches!(event, CaptureEvent::Begin { .. }) && !self.ensure_ready_for_begin(handle).await
+        {
+            log::info!("releasing capture: client {handle} is not ready yet");
+            capture.release().await?;
+            return Ok(());
+        }
+
         // activated a new client
         if matches!(event, CaptureEvent::Begin { .. }) && Some(handle) != self.active_client {
             self.state = State::WaitingForAck;
             self.active_client.replace(handle);
-            self.event_tx
-                .send(ICaptureEvent::ClientEntered(handle))
-                .expect("channel closed");
         }
 
-        let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
+        let opposite_pos = to_proto_pos(capture_pos.opposite());
 
         // If we're starting a fresh capture and the backend reported
         // a cursor position at the moment of crossing, send a
@@ -471,9 +528,8 @@ impl CaptureTask {
             cursor: Some(cursor),
         } = event
         {
-            let pos = self.get_pos(handle);
             capture.host_normalized_cursor(cursor).map(|(nx, ny)| {
-                let proto_pos = to_proto_pos(pos.opposite());
+                let proto_pos = to_proto_pos(capture_pos.opposite());
                 (proto_pos, nx, ny)
             })
         } else {

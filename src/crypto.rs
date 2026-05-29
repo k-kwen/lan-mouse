@@ -29,6 +29,10 @@ pub fn generate_fingerprint(cert: &[u8]) -> String {
     bytes.join(":").to_lowercase()
 }
 
+pub fn normalize_fingerprint(fingerprint: &str) -> String {
+    fingerprint.trim().to_ascii_lowercase()
+}
+
 pub fn certificate_fingerprint(cert: &Certificate) -> String {
     let certificate = cert.certificate.first().expect("certificate missing");
     generate_fingerprint(certificate)
@@ -68,4 +72,14 @@ pub(crate) fn generate_key_and_cert(path: &Path) -> Result<Certificate, Error> {
     let mut writer = BufWriter::new(f);
     writer.write_all(serialized.as_bytes())?;
     Ok(cert)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_fingerprint;
+
+    #[test]
+    fn normalize_fingerprint_trims_and_lowercases() {
+        assert_eq!(normalize_fingerprint(" AA:BB:cc "), "aa:bb:cc");
+    }
 }

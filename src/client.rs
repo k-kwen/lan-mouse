@@ -7,7 +7,7 @@ use std::{
 
 use slab::Slab;
 
-use lan_mouse_ipc::{ClientConfig, ClientHandle, ClientState, Position};
+use lan_mouse_ipc::{ClientAction, ClientConfig, ClientHandle, ClientState, Position};
 
 use crate::config::ConfigClient;
 
@@ -29,10 +29,13 @@ impl ClientManager {
     pub fn add_with_config(&self, config_client: ConfigClient) -> ClientHandle {
         let config = ClientConfig {
             hostname: config_client.hostname,
+            peer_fingerprint: config_client.peer_fingerprint,
             fix_ips: config_client.ips.into_iter().collect(),
             port: config_client.port,
             pos: config_client.pos,
             cmd: config_client.enter_hook,
+            cmd_leave: config_client.leave_hook,
+            actions: config_client.actions,
         };
         let state = ClientState {
             active: config_client.active,
@@ -129,6 +132,26 @@ impl ClientManager {
             .and_then(|(c, _)| c.hostname.clone())
     }
 
+    pub(crate) fn get_peer_fingerprint(&self, handle: ClientHandle) -> Option<String> {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .and_then(|(c, _)| c.peer_fingerprint.clone())
+    }
+
+    pub(crate) fn get_client_by_peer_fingerprint(&self, fingerprint: &str) -> Option<ClientHandle> {
+        self.clients
+            .borrow()
+            .iter()
+            .find_map(|(handle, (config, state))| {
+                if state.active && config.peer_fingerprint.as_deref() == Some(fingerprint) {
+                    Some(handle as ClientHandle)
+                } else {
+                    None
+                }
+            })
+    }
+
     /// get the position of the corresponding client
     pub(crate) fn get_pos(&self, handle: ClientHandle) -> Option<Position> {
         self.clients
@@ -205,6 +228,24 @@ impl ClientManager {
         }
     }
 
+    pub fn set_peer_fingerprint(
+        &self,
+        handle: ClientHandle,
+        peer_fingerprint: Option<String>,
+    ) -> bool {
+        let mut clients = self.clients.borrow_mut();
+        let Some((c, s)) = clients.get_mut(handle as usize) else {
+            return false;
+        };
+        if c.peer_fingerprint != peer_fingerprint {
+            c.peer_fingerprint = peer_fingerprint;
+            s.active_addr = None;
+            true
+        } else {
+            false
+        }
+    }
+
     /// update the port of the client
     pub(crate) fn set_port(&self, handle: ClientHandle, port: u16) {
         match self.clients.borrow_mut().get_mut(handle as usize) {
@@ -236,6 +277,20 @@ impl ClientManager {
         }
     }
 
+    /// update the leave hook command of the client
+    pub(crate) fn set_leave_hook(&self, handle: ClientHandle, leave_hook: Option<String>) {
+        if let Some((c, _s)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            c.cmd_leave = leave_hook;
+        }
+    }
+
+    /// replace native actions for the client
+    pub(crate) fn set_actions(&self, handle: ClientHandle, actions: Vec<ClientAction>) {
+        if let Some((c, _s)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            c.actions = actions;
+        }
+    }
+
     /// set resolving status of the client
     pub(crate) fn set_resolving(&self, handle: ClientHandle, status: bool) {
         if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
@@ -249,6 +304,22 @@ impl ClientManager {
             .borrow()
             .get(handle as usize)
             .and_then(|(c, _)| c.cmd.clone())
+    }
+
+    /// get the leave hook command
+    pub(crate) fn get_leave_cmd(&self, handle: ClientHandle) -> Option<String> {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .and_then(|(c, _)| c.cmd_leave.clone())
+    }
+
+    pub(crate) fn get_actions(&self, handle: ClientHandle) -> Vec<ClientAction> {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .map(|(c, _)| c.actions.clone())
+            .unwrap_or_default()
     }
 
     /// returns all clients that are currently registered

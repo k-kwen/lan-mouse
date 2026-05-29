@@ -107,6 +107,27 @@ jobs:
         name: lan-mouse-windows-x86_64
         path: lan-mouse-windows-x86_64.zip
 
+  windows-headless-release-build:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v6
+    - name: Release Build
+      run: cargo build --release --no-default-features
+    - name: Create Archive
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Force -Path "lan-mouse-windows-headless" | Out-Null
+        Copy-Item -Path "target\release\lan-mouse.exe" -Destination "lan-mouse-windows-headless"
+        Copy-Item -Path "scripts\windows\install-headless.ps1" -Destination "lan-mouse-windows-headless"
+        Copy-Item -Path "scripts\windows\uninstall-headless.ps1" -Destination "lan-mouse-windows-headless"
+        Copy-Item -Path "scripts\windows\README.md" -Destination "lan-mouse-windows-headless"
+        Compress-Archive -Path "lan-mouse-windows-headless\*" -DestinationPath lan-mouse-windows-headless-x86_64.zip
+    - name: Upload build artifact
+      uses: actions/upload-artifact@v6
+      with:
+        name: lan-mouse-windows-headless-x86_64
+        path: lan-mouse-windows-headless-x86_64.zip
+
   macos-release-build:
     runs-on: macos-15-intel
     steps:
@@ -169,7 +190,7 @@ jobs:
 
   release:
     name: "Release"
-    needs: [windows-release-build, linux-release-build, linux-arm64-release-build, macos-release-build, macos-arm64-release-build]
+    needs: [windows-release-build, windows-headless-release-build, linux-release-build, linux-arm64-release-build, macos-release-build, macos-arm64-release-build]
     runs-on: "ubuntu-latest"
     steps:
     - name: Download build artifacts
@@ -189,6 +210,7 @@ jobs:
           lan-mouse-macos-intel/lan-mouse-macos-intel.zip
           lan-mouse-macos-arm64/lan-mouse-macos-arm64.zip
           lan-mouse-windows-x86_64/lan-mouse-windows-x86_64.zip
+          lan-mouse-windows-headless-x86_64/lan-mouse-windows-headless-x86_64.zip
     - name: Create Tagged Release
       if: startsWith(github.ref, 'refs/tags/')
       uses: softprops/action-gh-release@v2
@@ -202,3 +224,4 @@ jobs:
           lan-mouse-macos-intel/lan-mouse-macos-intel.zip
           lan-mouse-macos-arm64/lan-mouse-macos-arm64.zip
           lan-mouse-windows-x86_64/lan-mouse-windows-x86_64.zip
+          lan-mouse-windows-headless-x86_64/lan-mouse-windows-headless-x86_64.zip

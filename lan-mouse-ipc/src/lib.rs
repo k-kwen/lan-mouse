@@ -132,6 +132,11 @@ impl TryFrom<&str> for Position {
 pub struct ClientConfig {
     /// hostname of this client
     pub hostname: Option<String>,
+    /// expected peer certificate fingerprint. When set, discovery and
+    /// dialing can identify this peer even if its hostname or IP
+    /// changes.
+    #[serde(default)]
+    pub peer_fingerprint: Option<String>,
     /// fix ips, determined by the user
     pub fix_ips: Vec<IpAddr>,
     /// both active_addr and addrs can be None / empty so port needs to be stored seperately
@@ -140,6 +145,12 @@ pub struct ClientConfig {
     pub pos: Position,
     /// enter hook
     pub cmd: Option<String>,
+    /// leave hook (fires when local cursor reclaims input from this remote client)
+    pub cmd_leave: Option<String>,
+    /// native actions executed on enter/leave. Hooks are retained as
+    /// fallback but no longer need to be the primary integration path.
+    #[serde(default)]
+    pub actions: Vec<ClientAction>,
 }
 
 impl Default for ClientConfig {
@@ -147,11 +158,37 @@ impl Default for ClientConfig {
         Self {
             port: DEFAULT_PORT,
             hostname: Default::default(),
+            peer_fingerprint: None,
             fix_ips: Default::default(),
             pos: Default::default(),
             cmd: None,
+            cmd_leave: None,
+            actions: vec![],
         }
     }
+}
+
+#[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ClientAction {
+    DdcVcp {
+        on: ActionTrigger,
+        /// Optional monitor selector. Matches case-insitively against
+        /// the physical monitor description; a numeric string selects
+        /// by zero-based enumeration index. Empty means the first
+        /// monitor.
+        #[serde(default)]
+        monitor: Option<String>,
+        code: u8,
+        value: u32,
+    },
+}
+
+#[derive(Debug, Eq, PartialEq, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ActionTrigger {
+    Enter,
+    Leave,
 }
 
 pub type ClientHandle = u64;
@@ -251,6 +288,8 @@ pub enum FrontendRequest {
     ResolveDns(ClientHandle),
     /// update hostname
     UpdateHostname(ClientHandle, Option<String>),
+    /// update expected peer certificate fingerprint
+    UpdatePeerFingerprint(ClientHandle, Option<String>),
     /// update port
     UpdatePort(ClientHandle, u16),
     /// update position
@@ -267,8 +306,12 @@ pub enum FrontendRequest {
     AuthorizeKey(String, String),
     /// remove fingerprint (fingerprint)
     RemoveAuthorizedKey(String),
-    /// change the hook command
-    UpdateEnterHook(u64, Option<String>),
+    /// change the enter hook command
+    UpdateEnterHook(ClientHandle, Option<String>),
+    /// change the leave hook command
+    UpdateLeaveHook(ClientHandle, Option<String>),
+    /// replace native client actions
+    UpdateActions(ClientHandle, Vec<ClientAction>),
     /// save config file
     SaveConfiguration,
     /// set the wall-press auto-release pixel threshold (0 = disabled)

@@ -6,7 +6,6 @@ use std::pin::Pin;
 
 use std::task::ready;
 use tokio::sync::mpsc::{Receiver, channel};
-
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
@@ -79,7 +78,7 @@ impl Capture for WindowsInputCapture {
 
 impl WindowsInputCapture {
     pub(crate) fn new() -> Self {
-        let (event_tx, event_rx) = channel(10);
+        let (event_tx, event_rx) = channel(1024);
         let event_thread = EventThread::new(event_tx);
         Self {
             event_thread,

@@ -1,3 +1,4 @@
+pub mod actions;
 mod capture;
 pub mod capture_test;
 pub mod client;
@@ -9,4 +10,5 @@ mod dns;
 mod emulation;
 pub mod emulation_test;
 mod listen;
+pub mod pairing;
 pub mod service;
