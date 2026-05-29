@@ -39,7 +39,10 @@ shadow-rs = { version = "1.2.0", features = ["metadata"] }
 toml = "0.8"
 toml_edit = { version = "0.22", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
-log = "0.4.20"
+# release_max_level_debug compiles out `trace!` in release builds —
+# removes the per-event hot-path trace logging (e.g. macOS consume()) while
+# keeping `debug!` available for diagnostics. Feature is unified globally.
+log = { version = "0.4.20", features = ["release_max_level_debug"] }
 env_logger = "0.11.3"
 serde_json = "1.0.107"
 tokio = { version = "1.32.0", features = [
