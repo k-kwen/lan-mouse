@@ -18,7 +18,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT_0, KEYEVENTF_EXTENDEDKEY, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, SendInput,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SetCursorPos, XBUTTON1, XBUTTON2,
+    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    SetCursorPos, XBUTTON1, XBUTTON2,
 };
 
 use super::{Emulation, EmulationHandle};
@@ -98,8 +99,24 @@ impl Emulation for WindowsEmulation {
     }
 
     async fn warp_cursor(&mut self, x: i32, y: i32) -> Result<(), EmulationError> {
+        // `x`/`y` arrive as 0-based virtual-screen coordinates: the
+        // receiver in src/emulation.rs scales the host's normalized
+        // (nx, ny) fraction against our `display_bounds` size — i.e.
+        // SM_CX/CYVIRTUALSCREEN — so the range is [0, virtual_size).
+        // `SetCursorPos`, however, expects coordinates in the screen
+        // system anchored at the PRIMARY monitor's top-left, where a
+        // monitor positioned left of / above the primary occupies
+        // NEGATIVE coordinates. Add the virtual-screen origin
+        // (SM_X/YVIRTUALSCREEN, negative for such layouts) so a 0-based
+        // point maps onto the true virtual edge. Without this, a
+        // `pos=Left` entry (tx == 0) warps to the primary's left edge —
+        // mid-desktop when a monitor sits further left — instead of the
+        // actual left edge of the virtual screen. Mirrors the
+        // origin handling on the input-capture side.
         unsafe {
-            let _ = SetCursorPos(x, y);
+            let ox = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            let oy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            let _ = SetCursorPos(x + ox, y + oy);
         }
         Ok(())
     }
