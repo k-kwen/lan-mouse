@@ -7,7 +7,6 @@ use crate::discovery::{
 };
 use lan_mouse_ipc::{ClientHandle, DEFAULT_PORT};
 use lan_mouse_proto::{MAX_EVENT_SIZE, ProtoEvent};
-use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -22,7 +21,10 @@ use std::{
 use thiserror::Error;
 use tokio::{
     net::UdpSocket,
-    sync::Mutex,
+    sync::{
+        Mutex,
+        mpsc::{self, Receiver, Sender, error::TrySendError},
+    },
     task::{JoinSet, spawn_blocking, spawn_local},
 };
 use webrtc_dtls::{
@@ -50,6 +52,7 @@ pub(crate) enum LanMouseConnectionError {
 }
 
 const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+const INBOUND_EVENT_QUEUE_CAPACITY: usize = 1024;
 
 /// Initial backoff between connect attempts that find no usable address
 /// (no static IPs, no DNS-resolved IPs, no mDNS primary hint). Doubles
@@ -82,6 +85,34 @@ fn signature_of(ips: &HashSet<IpAddr>, primary: Option<IpAddr>) -> u64 {
     sorted.hash(&mut hasher);
     primary.hash(&mut hasher);
     hasher.finish()
+}
+
+pub(crate) fn is_droppable_inbound_event(event: &ProtoEvent) -> bool {
+    matches!(
+        event,
+        ProtoEvent::Input(input_event::Event::Pointer(
+            input_event::PointerEvent::Motion { .. }
+        ))
+    )
+}
+
+async fn send_received_event(
+    tx: &Sender<(ClientHandle, ProtoEvent)>,
+    handle: ClientHandle,
+    event: ProtoEvent,
+) -> bool {
+    if is_droppable_inbound_event(&event) {
+        match tx.try_send((handle, event)) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                log::debug!("dropping pointer motion for client {handle}: inbound queue full");
+                true
+            }
+            Err(TrySendError::Closed(_)) => false,
+        }
+    } else {
+        tx.send((handle, event)).await.is_ok()
+    }
 }
 
 fn reserve_attempt_slot(
@@ -340,7 +371,7 @@ impl LanMouseConnection {
         fingerprint_hints: FingerprintCache,
         last_success_cache_path: Option<PathBuf>,
     ) -> Self {
-        let (recv_tx, recv_rx) = channel();
+        let (recv_tx, recv_rx) = mpsc::channel(INBOUND_EVENT_QUEUE_CAPACITY);
         Self {
             cert,
             client_manager,
@@ -634,7 +665,7 @@ async fn receive_loop(
                         client_manager.set_peer_commit(handle, Some(commit));
                     }
                     event => {
-                        if tx.send((handle, event)).is_err() {
+                        if !send_received_event(&tx, handle, event).await {
                             log::debug!(
                                 "receive loop for client {handle} @ {addr} stopped: channel closed"
                             );
@@ -741,5 +772,33 @@ mod tests {
         assert_eq!(state.signature, 12);
         assert_eq!(state.backoff, INITIAL_RETRY_BACKOFF);
         assert!(state.connecting);
+    }
+
+    #[test]
+    fn only_pointer_motion_is_droppable_under_backpressure() {
+        use input_event::{Event, KeyboardEvent, PointerEvent};
+
+        assert!(is_droppable_inbound_event(&ProtoEvent::Input(
+            Event::Pointer(PointerEvent::Motion {
+                time: 0,
+                dx: 1.0,
+                dy: 1.0,
+            })
+        )));
+        assert!(!is_droppable_inbound_event(&ProtoEvent::Input(
+            Event::Pointer(PointerEvent::Button {
+                time: 0,
+                button: input_event::BTN_LEFT,
+                state: 0,
+            })
+        )));
+        assert!(!is_droppable_inbound_event(&ProtoEvent::Input(
+            Event::Keyboard(KeyboardEvent::Key {
+                time: 0,
+                key: 30,
+                state: 0,
+            })
+        )));
+        assert!(!is_droppable_inbound_event(&ProtoEvent::Leave(0)));
     }
 }

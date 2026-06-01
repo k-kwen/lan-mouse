@@ -1,6 +1,8 @@
 use futures::{Stream, StreamExt};
 use lan_mouse_proto::{MAX_EVENT_SIZE, ProtoEvent};
-use local_channel::mpsc::{Receiver, Sender, channel};
+use local_channel::mpsc::{
+    Receiver as LocalReceiver, Sender as LocalSender, channel as local_channel,
+};
 use rustls::pki_types::CertificateDer;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -12,7 +14,10 @@ use std::{
 use thiserror::Error;
 use tokio::time::MissedTickBehavior;
 use tokio::{
-    sync::Mutex as AsyncMutex,
+    sync::{
+        Mutex as AsyncMutex,
+        mpsc::{self, Receiver, Sender, error::TrySendError},
+    },
     task::{JoinHandle, spawn_local},
 };
 use webrtc_dtls::{
@@ -23,7 +28,9 @@ use webrtc_dtls::{
 };
 use webrtc_util::{Conn, Error, conn::Listener};
 
-use crate::crypto;
+use crate::{connect::is_droppable_inbound_event, crypto};
+
+const LISTEN_EVENT_QUEUE_CAPACITY: usize = 1024;
 
 #[derive(Error, Debug)]
 pub enum ListenerCreationError {
@@ -54,11 +61,10 @@ pub(crate) enum ListenEvent {
 
 pub(crate) struct LanMouseListener {
     listen_rx: Receiver<ListenEvent>,
-    listen_tx: Sender<ListenEvent>,
     listen_task: JoinHandle<()>,
     conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>>,
-    request_port_change: Sender<u16>,
-    port_changed: Receiver<Result<u16, ListenerCreationError>>,
+    request_port_change: LocalSender<u16>,
+    port_changed: LocalReceiver<Result<u16, ListenerCreationError>>,
 }
 
 type VerifyPeerCertificateFn = Arc<
@@ -90,9 +96,9 @@ impl LanMouseListener {
         cert: Certificate,
         authorized_keys: Arc<RwLock<HashMap<String, String>>>,
     ) -> Result<Self, ListenerCreationError> {
-        let (listen_tx, listen_rx) = channel();
-        let (request_port_change, request_port_change_rx) = channel();
-        let (port_changed_tx, port_changed) = channel();
+        let (listen_tx, listen_rx) = mpsc::channel(LISTEN_EVENT_QUEUE_CAPACITY);
+        let (request_port_change, request_port_change_rx) = local_channel();
+        let (port_changed_tx, port_changed) = local_channel();
         let connection_attempts: Arc<Mutex<VecDeque<String>>> = Default::default();
 
         let authorized = authorized_keys.clone();
@@ -200,7 +206,6 @@ impl LanMouseListener {
         Ok(Self {
             conns,
             listen_rx,
-            listen_tx,
             listen_task,
             port_changed,
             request_port_change,
@@ -221,7 +226,7 @@ impl LanMouseListener {
         for (_, conn) in conns.iter() {
             let _ = conn.close().await;
         }
-        self.listen_tx.close();
+        self.listen_rx.close();
     }
 
     pub(crate) async fn reply(&self, addr: SocketAddr, event: ProtoEvent) {
@@ -262,7 +267,25 @@ impl Stream for LanMouseListener {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        self.listen_rx.poll_next_unpin(cx)
+        self.listen_rx.poll_recv(cx)
+    }
+}
+
+async fn send_listen_event(tx: &Sender<ListenEvent>, event: ListenEvent) -> bool {
+    if matches!(
+        &event,
+        ListenEvent::Msg { event, .. } if is_droppable_inbound_event(event)
+    ) {
+        match tx.try_send(event) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                log::debug!("dropping pointer motion from listener: inbound queue full");
+                true
+            }
+            Err(TrySendError::Closed(_)) => false,
+        }
+    } else {
+        tx.send(event).await.is_ok()
     }
 }
 
@@ -329,9 +352,11 @@ fn spawn_accept_task(
                         let certs = dtls_conn.connection_state().await.peer_certificates;
                         let cert = certs.first().expect("cert");
                         let fingerprint = crypto::generate_fingerprint(cert);
-                        if listen_tx
-                            .send(ListenEvent::Accept { addr, fingerprint })
-                            .is_err()
+                        if !send_listen_event(
+                            &listen_tx,
+                            ListenEvent::Accept { addr, fingerprint },
+                        )
+                        .await
                         {
                             log::debug!("listen event channel closed; stopping accept task");
                             break;
@@ -343,12 +368,15 @@ fn spawn_accept_task(
                             if let Some(de) = se.0.downcast_ref::<webrtc_dtls::Error>() {
                                 match de {
                                     webrtc_dtls::Error::ErrVerifyDataMismatch => {
-                                        if let Some(fingerprint) =
+                                        let fingerprint = {
                                             connection_attempts.lock().expect("lock").pop_front()
-                                        {
-                                            if listen_tx
-                                                .send(ListenEvent::Rejected { fingerprint })
-                                                .is_err()
+                                        };
+                                        if let Some(fingerprint) = fingerprint {
+                                            if !send_listen_event(
+                                                &listen_tx,
+                                                ListenEvent::Rejected { fingerprint },
+                                            )
+                                            .await
                                             {
                                                 log::debug!(
                                                     "listen event channel closed; stopping accept task"
@@ -385,8 +413,8 @@ fn spawn_supervisor_task(
     listen_tx: Sender<ListenEvent>,
     conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>>,
     connection_attempts: Arc<Mutex<VecDeque<String>>>,
-    mut request_port_change_rx: Receiver<u16>,
-    port_changed_tx: Sender<Result<u16, ListenerCreationError>>,
+    mut request_port_change_rx: LocalReceiver<u16>,
+    port_changed_tx: LocalSender<Result<u16, ListenerCreationError>>,
 ) -> JoinHandle<()> {
     spawn_local(async move {
         let mut port = initial_port;
@@ -550,7 +578,7 @@ async fn read_loop(
     while conn.recv(&mut b).await.is_ok() {
         match b.try_into() {
             Ok(event) => {
-                if dtls_tx.send(ListenEvent::Msg { event, addr }).is_err() {
+                if !send_listen_event(&dtls_tx, ListenEvent::Msg { event, addr }).await {
                     log::debug!("listen event channel closed; stopping read loop for {addr}");
                     break;
                 }
