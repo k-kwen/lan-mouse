@@ -11,7 +11,7 @@ use input_capture::{
     CaptureCreationError, CaptureError, CaptureEvent, CaptureHandle, InputCapture,
     InputCaptureError, Position,
 };
-use input_event::{Event, KeyboardEvent, scancode};
+use input_event::{Event, KeyboardEvent, PointerEvent, scancode};
 use lan_mouse_proto::ProtoEvent;
 use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
@@ -548,7 +548,9 @@ impl CaptureTask {
 
         if let Err(e) = self.conn.send(proto_event, handle).await {
             const DUR: Duration = Duration::from_millis(500);
-            if matches!(e, LanMouseConnectionError::TargetEmulationDisabled) {
+            if matches!(e, LanMouseConnectionError::TargetEmulationDisabled)
+                && can_drop_while_target_emulation_disabled(event)
+            {
                 debounce!(
                     PREV_LOG,
                     DUR,
@@ -660,6 +662,65 @@ fn should_auto_retry_capture(error: &InputCaptureError) -> bool {
 #[cfg(not(target_os = "macos"))]
 fn should_auto_retry_capture(_error: &InputCaptureError) -> bool {
     false
+}
+
+fn can_drop_while_target_emulation_disabled(event: CaptureEvent) -> bool {
+    matches!(
+        event,
+        CaptureEvent::Input(Event::Pointer(
+            PointerEvent::Motion { .. }
+                | PointerEvent::Axis { .. }
+                | PointerEvent::AxisDiscrete120 { .. }
+        ))
+    )
+}
+
+#[cfg(test)]
+mod target_disabled_tests {
+    use super::*;
+    use input_event::BTN_LEFT;
+
+    #[test]
+    fn only_stateless_pointer_events_are_dropped_when_target_emulation_is_disabled() {
+        assert!(can_drop_while_target_emulation_disabled(
+            CaptureEvent::Input(Event::Pointer(PointerEvent::Motion {
+                time: 0,
+                dx: 1.0,
+                dy: 1.0,
+            }))
+        ));
+        assert!(can_drop_while_target_emulation_disabled(
+            CaptureEvent::Input(Event::Pointer(PointerEvent::Axis {
+                time: 0,
+                axis: 0,
+                value: 1.0,
+            }))
+        ));
+        assert!(can_drop_while_target_emulation_disabled(
+            CaptureEvent::Input(Event::Pointer(PointerEvent::AxisDiscrete120 {
+                axis: 0,
+                value: 120,
+            }))
+        ));
+
+        assert!(!can_drop_while_target_emulation_disabled(
+            CaptureEvent::Input(Event::Pointer(PointerEvent::Button {
+                time: 0,
+                button: BTN_LEFT,
+                state: 0,
+            }))
+        ));
+        assert!(!can_drop_while_target_emulation_disabled(
+            CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+                time: 0,
+                key: 30,
+                state: 0,
+            }))
+        ));
+        assert!(!can_drop_while_target_emulation_disabled(
+            CaptureEvent::Begin { cursor: None }
+        ));
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]
