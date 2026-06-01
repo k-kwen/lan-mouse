@@ -893,7 +893,7 @@ fn clamp_to_screen_space(
     let current_display = match get_display_at_point(current_x, current_y) {
         Some(display) => display,
         None => {
-            log::warn!("could not get current display!");
+            log::debug!("could not get current display");
             return (current_x, current_y);
         }
     };

@@ -544,11 +544,6 @@ impl InputCapture {
                 // arrives after Begin.
                 self.pending_begin_cursor = *cursor;
                 self.pending_motion = (0.0, 0.0);
-                log::info!(
-                    "[wp-begin] pos={pos} cursor={cursor:?} peer_bounds={:?} virtual_cursor={:?}",
-                    self.peer_bounds.get(&pos).copied(),
-                    self.virtual_cursor,
-                );
             }
             CaptureEvent::AutoRelease => {
                 // Don't reset virtual_cursor here — release() needs it
