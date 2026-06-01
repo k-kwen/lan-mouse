@@ -73,6 +73,23 @@ if ($PSCmdlet.ShouldProcess($InstallDir, "Install lan-mouse headless runtime")) 
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
     New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
 
+    if (-not $NoTask) {
+        $ExistingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        if ($null -ne $ExistingTask) {
+            Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 1
+        }
+    }
+    Get-Process -Name "lan-mouse" -ErrorAction SilentlyContinue |
+        Where-Object {
+            try {
+                $_.Path -eq $ExeDest
+            } catch {
+                $false
+            }
+        } |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+
     Copy-Item -LiteralPath $ExePath -Destination $ExeDest -Force
 
     $HasMonitorSwitch = -not [string]::IsNullOrWhiteSpace($MonitorSelector) -and
