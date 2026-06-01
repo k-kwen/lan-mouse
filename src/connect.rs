@@ -65,11 +65,15 @@ const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 /// last attempted; if the current set differs we skip the gate and
 /// retry immediately. Otherwise `next_attempt_at` enforces exponential
 /// backoff capped at [`MAX_RETRY_BACKOFF`].
-struct RetryState {
+#[derive(Debug, Clone)]
+struct ConnectionAttemptState {
+    connecting: bool,
     next_attempt_at: Instant,
     backoff: Duration,
     signature: u64,
 }
+
+type AttemptStates = Rc<RefCell<HashMap<ClientHandle, ConnectionAttemptState>>>;
 
 fn signature_of(ips: &HashSet<IpAddr>, primary: Option<IpAddr>) -> u64 {
     let mut sorted: Vec<IpAddr> = ips.iter().copied().collect();
@@ -80,27 +84,77 @@ fn signature_of(ips: &HashSet<IpAddr>, primary: Option<IpAddr>) -> u64 {
     hasher.finish()
 }
 
-/// Update `retry_state[handle]` after a failed connect attempt: doubles
-/// the backoff (capped at [`MAX_RETRY_BACKOFF`]) and stamps the
-/// candidate-set signature so a later signature change can short-
-/// circuit the gate.
-fn record_retry_failure(
-    retry_state: &Rc<RefCell<HashMap<ClientHandle, RetryState>>>,
+fn reserve_attempt_slot(
+    attempts: &mut HashMap<ClientHandle, ConnectionAttemptState>,
+    handle: ClientHandle,
+    signature: u64,
+    now: Instant,
+) -> bool {
+    match attempts.get_mut(&handle) {
+        None => {
+            attempts.insert(
+                handle,
+                ConnectionAttemptState {
+                    connecting: true,
+                    next_attempt_at: now,
+                    backoff: INITIAL_RETRY_BACKOFF,
+                    signature,
+                },
+            );
+            true
+        }
+        Some(state) if state.connecting => false,
+        Some(state) if state.signature != signature => {
+            state.connecting = true;
+            state.signature = signature;
+            state.next_attempt_at = now;
+            state.backoff = INITIAL_RETRY_BACKOFF;
+            true
+        }
+        Some(state) if now >= state.next_attempt_at => {
+            state.connecting = true;
+            true
+        }
+        Some(_) => false,
+    }
+}
+
+fn record_attempt_failure_with_signature(
+    attempts: &mut HashMap<ClientHandle, ConnectionAttemptState>,
+    handle: ClientHandle,
+    signature: u64,
+    now: Instant,
+) {
+    let entry = attempts.entry(handle).or_insert(ConnectionAttemptState {
+        connecting: false,
+        next_attempt_at: now,
+        backoff: INITIAL_RETRY_BACKOFF,
+        signature,
+    });
+    entry.connecting = false;
+    entry.signature = signature;
+    let next = entry.backoff;
+    entry.next_attempt_at = now + next;
+    entry.backoff = (next * 2).min(MAX_RETRY_BACKOFF);
+}
+
+/// Update `attempt_states[handle]` after a failed connect attempt:
+/// clears the in-flight marker, doubles the backoff (capped at
+/// [`MAX_RETRY_BACKOFF`]), and stamps the candidate-set signature so a
+/// later signature change can short-circuit the gate.
+fn record_attempt_failure(
+    attempt_states: &AttemptStates,
     handle: ClientHandle,
     ips: &HashSet<IpAddr>,
     primary: Option<IpAddr>,
 ) {
     let sig = signature_of(ips, primary);
-    let mut map = retry_state.borrow_mut();
-    let entry = map.entry(handle).or_insert(RetryState {
-        next_attempt_at: Instant::now(),
-        backoff: INITIAL_RETRY_BACKOFF,
-        signature: sig,
-    });
-    entry.signature = sig;
-    let next = entry.backoff;
-    entry.next_attempt_at = Instant::now() + next;
-    entry.backoff = (next * 2).min(MAX_RETRY_BACKOFF);
+    let mut attempts = attempt_states.borrow_mut();
+    record_attempt_failure_with_signature(&mut attempts, handle, sig, Instant::now());
+}
+
+fn clear_attempt_state(attempt_states: &AttemptStates, handle: ClientHandle) {
+    attempt_states.borrow_mut().remove(&handle);
 }
 
 fn discovery_hint_for(
@@ -255,7 +309,6 @@ pub(crate) struct LanMouseConnection {
     cert: Certificate,
     client_manager: ClientManager,
     conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
-    connecting: Rc<Mutex<HashSet<ClientHandle>>>,
     recv_rx: Receiver<(ClientHandle, ProtoEvent)>,
     recv_tx: Sender<(ClientHandle, ProtoEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
@@ -268,13 +321,10 @@ pub(crate) struct LanMouseConnection {
     /// This makes the configured certificate identity the preferred
     /// discovery key when available; hostname is only the fallback.
     fingerprint_hints: FingerprintCache,
-    /// Per-handle retry gate. Suppresses connect spawns when the
-    /// previous attempt failed and nothing new is available to dial,
-    /// so an offline peer doesn't trigger a fresh `connect_to_handle`
-    /// (and the associated DNS / mDNS lookup churn) on every mouse
-    /// event. Cleared on successful connect; bypassed automatically
-    /// when the candidate-set signature changes.
-    retry_state: Rc<RefCell<HashMap<ClientHandle, RetryState>>>,
+    /// Per-handle connect-attempt state. Tracks both in-flight
+    /// attempts and retry backoff in one map so reservation, cooldown,
+    /// and completion cannot drift across separate locks.
+    attempt_states: AttemptStates,
     /// Persistent last-success cache path. Successful DTLS handshakes
     /// write the peer fingerprint -> IP candidate here so a daemon
     /// restart keeps dynamic-IP recovery warm even before fresh mDNS
@@ -295,13 +345,12 @@ impl LanMouseConnection {
             cert,
             client_manager,
             conns: Default::default(),
-            connecting: Default::default(),
+            attempt_states: Default::default(),
             recv_rx,
             recv_tx,
             ping_response: Default::default(),
             primary_hints,
             fingerprint_hints,
-            retry_state: Default::default(),
             last_success_cache_path,
         }
     }
@@ -360,20 +409,17 @@ impl LanMouseConnection {
         if self.is_connected(handle).await {
             return true;
         }
-        let mut connecting = self.connecting.lock().await;
-        if !connecting.contains(&handle) && self.should_attempt(handle) {
-            connecting.insert(handle);
+        if self.reserve_attempt(handle) {
             spawn_local(connect_to_handle(
                 self.client_manager.clone(),
                 self.cert.clone(),
                 handle,
                 self.conns.clone(),
-                self.connecting.clone(),
+                self.attempt_states.clone(),
                 self.recv_tx.clone(),
                 self.ping_response.clone(),
                 self.primary_hints.clone(),
                 self.fingerprint_hints.clone(),
-                self.retry_state.clone(),
                 self.last_success_cache_path.clone(),
             ));
         }
@@ -389,7 +435,7 @@ impl LanMouseConnection {
     ///
     /// Otherwise returns false; the caller treats this as "still in
     /// cooldown, keep returning NotConnected silently."
-    fn should_attempt(&self, handle: ClientHandle) -> bool {
+    fn reserve_attempt(&self, handle: ClientHandle) -> bool {
         let mut ips = self.client_manager.get_ips(handle).unwrap_or_default();
         ips.retain(|ip| is_usable_candidate_ip(*ip));
         ips.extend(discovery_candidates_for(
@@ -404,17 +450,12 @@ impl LanMouseConnection {
             &self.fingerprint_hints,
         );
         let sig = signature_of(&ips, primary);
-        let mut state = self.retry_state.borrow_mut();
-        match state.get_mut(&handle) {
-            None => true,
-            Some(s) if s.signature != sig => {
-                s.signature = sig;
-                s.next_attempt_at = Instant::now();
-                s.backoff = INITIAL_RETRY_BACKOFF;
-                true
-            }
-            Some(s) => Instant::now() >= s.next_attempt_at,
-        }
+        reserve_attempt_slot(
+            &mut self.attempt_states.borrow_mut(),
+            handle,
+            sig,
+            Instant::now(),
+        )
     }
 }
 
@@ -424,12 +465,11 @@ async fn connect_to_handle(
     cert: Certificate,
     handle: ClientHandle,
     conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
-    connecting: Rc<Mutex<HashSet<ClientHandle>>>,
+    attempt_states: AttemptStates,
     tx: Sender<(ClientHandle, ProtoEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
     primary_hints: PrimaryCache,
     fingerprint_hints: FingerprintCache,
-    retry_state: Rc<RefCell<HashMap<ClientHandle, RetryState>>>,
     last_success_cache_path: Option<PathBuf>,
 ) -> Result<(), LanMouseConnectionError> {
     log::info!("client {handle} connecting ...");
@@ -462,18 +502,16 @@ async fn connect_to_handle(
         if addrs.is_empty() && preferred.is_none() {
             // Nothing to dial. Bump backoff and bail without spawning
             // DTLS work or spamming logs on every subsequent mouse
-            // event — `should_attempt` will keep gating until either
+            // event — `reserve_attempt` will keep gating until either
             // the backoff elapses or new info arrives.
-            record_retry_failure(&retry_state, handle, &ips_set, primary_ip);
-            connecting.lock().await.remove(&handle);
+            record_attempt_failure(&attempt_states, handle, &ips_set, primary_ip);
             return Err(LanMouseConnectionError::NotConnected);
         }
         let res = connect_any(&addrs, preferred, cert, expected_fingerprint.clone()).await;
         let (conn, addr) = match res {
             Ok(c) => c,
             Err(e) => {
-                record_retry_failure(&retry_state, handle, &ips_set, primary_ip);
-                connecting.lock().await.remove(&handle);
+                record_attempt_failure(&attempt_states, handle, &ips_set, primary_ip);
                 return Err(e);
             }
         };
@@ -496,8 +534,7 @@ async fn connect_to_handle(
         client_manager.set_active_addr(handle, Some(addr));
         client_manager.set_alive(handle, false);
         conns.lock().await.insert(addr, conn.clone());
-        connecting.lock().await.remove(&handle);
-        retry_state.borrow_mut().remove(&handle);
+        clear_attempt_state(&attempt_states, handle);
 
         // Best-effort version handshake. Send our commit hash once
         // immediately after the DTLS handshake; the listen side
@@ -528,7 +565,7 @@ async fn connect_to_handle(
         ));
         return Ok(());
     }
-    connecting.lock().await.remove(&handle);
+    clear_attempt_state(&attempt_states, handle);
     Err(LanMouseConnectionError::NotConnected)
 }
 
@@ -648,4 +685,61 @@ async fn disconnect(
     }
     let active: Vec<SocketAddr> = conns.lock().await.keys().copied().collect();
     log::info!("active connections: {active:?}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attempt_slot_rejects_duplicate_while_connecting() {
+        let mut attempts = HashMap::new();
+        let now = Instant::now();
+
+        assert!(reserve_attempt_slot(&mut attempts, 7, 11, now));
+        assert!(!reserve_attempt_slot(&mut attempts, 7, 11, now));
+        assert!(attempts.get(&7).is_some_and(|state| state.connecting));
+    }
+
+    #[test]
+    fn attempt_failure_sets_backoff_and_allows_after_cooldown() {
+        let mut attempts = HashMap::new();
+        let now = Instant::now();
+
+        assert!(reserve_attempt_slot(&mut attempts, 7, 11, now));
+        record_attempt_failure_with_signature(&mut attempts, 7, 11, now);
+
+        assert!(!reserve_attempt_slot(
+            &mut attempts,
+            7,
+            11,
+            now + Duration::from_millis(500)
+        ));
+        assert!(reserve_attempt_slot(
+            &mut attempts,
+            7,
+            11,
+            now + INITIAL_RETRY_BACKOFF
+        ));
+    }
+
+    #[test]
+    fn attempt_signature_change_bypasses_backoff() {
+        let mut attempts = HashMap::new();
+        let now = Instant::now();
+
+        assert!(reserve_attempt_slot(&mut attempts, 7, 11, now));
+        record_attempt_failure_with_signature(&mut attempts, 7, 11, now);
+
+        assert!(reserve_attempt_slot(
+            &mut attempts,
+            7,
+            12,
+            now + Duration::from_millis(100)
+        ));
+        let state = attempts.get(&7).expect("attempt state");
+        assert_eq!(state.signature, 12);
+        assert_eq!(state.backoff, INITIAL_RETRY_BACKOFF);
+        assert!(state.connecting);
+    }
 }
