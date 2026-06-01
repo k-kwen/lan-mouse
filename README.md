@@ -1,6 +1,6 @@
 # Lan Mouse
 
-> **Personal fork.** Carries a Korean IME toggle (Right Alt → input source) on macOS plus a cherry-pick of upstream PR [#433](https://github.com/feschber/lan-mouse/pull/433) (mDNS-SD auto-discovery). Built for the maintainer's own setup; please use the upstream project at [feschber/lan-mouse](https://github.com/feschber/lan-mouse) instead.
+> **Personal fork.** Preserves Right Alt as Right Option on macOS plus a cherry-pick of upstream PR [#433](https://github.com/feschber/lan-mouse/pull/433) (mDNS-SD auto-discovery). Built for the maintainer's own setup; please use the upstream project at [feschber/lan-mouse](https://github.com/feschber/lan-mouse) instead.
 
 [![CI](https://github.com/feschber/lan-mouse/actions/workflows/rust.yml/badge.svg)](https://github.com/feschber/lan-mouse/actions/workflows/rust.yml) [![Cachix](https://github.com/feschber/lan-mouse/actions/workflows/cachix.yml/badge.svg)](https://github.com/feschber/lan-mouse/actions/workflows/cachix.yml) [![Release](https://github.com/feschber/lan-mouse/actions/workflows/release.yml/badge.svg)](https://github.com/feschber/lan-mouse/actions/workflows/release.yml)
 

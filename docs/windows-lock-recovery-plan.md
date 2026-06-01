@@ -13,9 +13,8 @@ for a manual `enable-capture` request in a headless daemon.
 The macOS side now auto-retries recoverable event-tap failures and logs directly
 to `~/Library/Logs/lan-mouse/daemon.log`, so future lock/unlock failures should
 leave usable evidence without needing stdout/stderr to be connected at launch.
-It also debounces the macOS remote `Right Alt` IME toggle path, because rapid
-duplicate Right Alt down events can make PriType/ABC input sources flip twice
-and leave the visible language popup out of sync with actual text input.
+Right Alt now passes through as macOS Right Option instead of driving the
+Text Input Source toggle path.
 
 ## Current Windows behavior
 
@@ -45,14 +44,11 @@ This can leave the macOS side believing handoff succeeded while Windows cannot
 consume the input, especially if both sides are locked and unlock timing races
 with an `Enter`/`Ack` exchange.
 
-There is also a Windows-to-macOS IME interaction to keep in mind. The Windows
-side sends the Korean keyboard's Hangul/English key as a Right Alt-style event in
-the current path, and macOS maps that to direct Text Input Source switching.
-If Windows emits both a Hangul semantic event and a Right Alt key event, or emits
-duplicate Right Alt down/up pairs around a language switch, macOS can see
-multiple toggles for one intended switch. The macOS side now has a short
-debounce, but the Windows side should still avoid sending duplicate semantic
-toggle events.
+There is also a Windows-to-macOS keyboard interaction to keep in mind. The
+Windows side sends the Korean keyboard's Hangul/English key as a Right Alt-style
+event in the current path, and macOS now preserves that as Right Option instead
+of directly switching the Text Input Source. The Windows side should still avoid
+sending duplicate Right Alt/Hangul events for one physical action.
 
 ## Fix direction
 
@@ -87,11 +83,11 @@ Add lock-state awareness to the Windows emulation side, not only capture:
    retries event-tap interruption. Windows should suppress local capture while
    locked and also report remote emulation unavailability while locked.
 
-7. Normalize Korean IME toggle events at the Windows edge.
-   Treat the Hangul/English key as one semantic toggle. Do not send both the
-   translated Right Alt key and a separate Hangul toggle for the same physical
-   action. Add a small diagnostic log that records the raw Windows virtual key,
-   scan code, and emitted lan-mouse key code for Right Alt/Hangul transitions.
+7. Normalize Right Alt/Hangul events at the Windows edge.
+   Treat the Hangul/English key as one physical action. Do not send both the
+   translated Right Alt key and a separate Hangul event for the same action. Add
+   a small diagnostic log that records the raw Windows virtual key, scan code,
+   and emitted lan-mouse key code for Right Alt/Hangul transitions.
 
 ## Smoke tests for the Windows patch
 
@@ -107,8 +103,8 @@ Add lock-state awareness to the Windows emulation side, not only capture:
 - Verify logs around `WTS_SESSION_LOCK`, `WTS_SESSION_UNLOCK`, `Enter`, `Ack`,
   `Leave`, `SendInput` failure, and recovery.
 - On a Korean keyboard, press Hangul/English once while controlling macOS and
-  verify exactly one macOS `Right Alt -> Korean IME toggle` log line and one
-  resulting `TIS: switched to ...` line.
+  verify that it arrives as macOS Right Option, without `Right Alt -> Korean IME
+  toggle` or `TIS: switched to ...` logs.
 
 ## Related local branches
 
