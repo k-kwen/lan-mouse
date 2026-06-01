@@ -17,9 +17,11 @@ use lan_mouse_ipc::{
 };
 use log;
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
     io,
     net::{IpAddr, SocketAddr},
+    rc::Rc,
     sync::{Arc, RwLock},
     time::Duration,
 };
@@ -74,6 +76,8 @@ pub struct Service {
     capture_recovery_attempts: u8,
     /// consecutive health ticks where emulation was disabled
     emulation_recovery_attempts: u8,
+    /// currently running enter/leave hook+action tasks, keyed per client and edge.
+    hook_tasks: Rc<RefCell<HashSet<(ClientHandle, HookKind)>>>,
     /// keep track of registered connections to avoid duplicate barriers
     incoming_conns: HashSet<SocketAddr>,
     /// map from capture handle to connection info
@@ -172,6 +176,7 @@ impl Service {
             emulation_status: Default::default(),
             capture_recovery_attempts: 0,
             emulation_recovery_attempts: 0,
+            hook_tasks: Default::default(),
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
             next_trigger_handle: 0,
@@ -529,7 +534,6 @@ impl Service {
     }
 
     fn health_check(&mut self) -> Result<(), ServiceError> {
-        const MAX_RECOVERY_ATTEMPTS: u8 = 3;
         let active_clients = self.client_manager.active_clients().len();
         let incoming = self.incoming_conns.len();
         log::info!(
@@ -546,30 +550,20 @@ impl Service {
         if self.capture_status == Status::Disabled {
             self.capture_recovery_attempts = self.capture_recovery_attempts.saturating_add(1);
             log::warn!(
-                "health: capture disabled; requesting re-enable (attempt {}/{MAX_RECOVERY_ATTEMPTS})",
+                "health: capture disabled; requesting re-enable (attempt {})",
                 self.capture_recovery_attempts,
             );
             self.capture.reenable();
-            if self.capture_recovery_attempts >= MAX_RECOVERY_ATTEMPTS {
-                return Err(ServiceError::Health(format!(
-                    "capture backend stayed disabled after {MAX_RECOVERY_ATTEMPTS} recovery attempts"
-                )));
-            }
         } else {
             self.capture_recovery_attempts = 0;
         }
         if self.emulation_status == Status::Disabled {
             self.emulation_recovery_attempts = self.emulation_recovery_attempts.saturating_add(1);
             log::warn!(
-                "health: emulation disabled; requesting re-enable (attempt {}/{MAX_RECOVERY_ATTEMPTS})",
+                "health: emulation disabled; requesting re-enable (attempt {})",
                 self.emulation_recovery_attempts,
             );
             self.emulation.reenable();
-            if self.emulation_recovery_attempts >= MAX_RECOVERY_ATTEMPTS {
-                return Err(ServiceError::Health(format!(
-                    "emulation backend stayed disabled after {MAX_RECOVERY_ATTEMPTS} recovery attempts"
-                )));
-            }
         } else {
             self.emulation_recovery_attempts = 0;
         }
@@ -806,6 +800,12 @@ impl Service {
             return;
         }
         let label = kind.label();
+        let key = (handle, kind);
+        if !self.hook_tasks.borrow_mut().insert(key) {
+            log::debug!("{label} hook/action for client {handle} is already running");
+            return;
+        }
+        let hook_tasks = self.hook_tasks.clone();
         tokio::task::spawn_local(async move {
             for action in actions {
                 log::info!("running {label} action: {action:?}");
@@ -814,34 +814,34 @@ impl Service {
                     Err(e) => log::warn!("{label} action failed: {e}"),
                 }
             }
-            let Some(cmd) = cmd else { return };
-            log::info!("spawning {label} hook: {cmd}");
-            #[cfg(windows)]
-            let spawn_res = Command::new("cmd").arg("/C").arg(cmd.as_str()).spawn();
-            #[cfg(not(windows))]
-            let spawn_res = Command::new("sh").arg("-c").arg(cmd.as_str()).spawn();
-            let mut child = match spawn_res {
-                Ok(c) => c,
-                Err(e) => {
-                    log::warn!("could not execute {label} hook `{cmd}`: {e}");
-                    return;
-                }
-            };
-            match child.wait().await {
-                Ok(s) => {
-                    if s.success() {
-                        log::info!("{label} hook `{cmd}` exited successfully");
-                    } else {
-                        log::warn!("{label} hook `{cmd}` exited with {s}");
+            if let Some(cmd) = cmd {
+                log::info!("spawning {label} hook: {cmd}");
+                #[cfg(windows)]
+                let spawn_res = Command::new("cmd").arg("/C").arg(cmd.as_str()).spawn();
+                #[cfg(not(windows))]
+                let spawn_res = Command::new("sh").arg("-c").arg(cmd.as_str()).spawn();
+                match spawn_res {
+                    Ok(mut child) => match child.wait().await {
+                        Ok(s) => {
+                            if s.success() {
+                                log::info!("{label} hook `{cmd}` exited successfully");
+                            } else {
+                                log::warn!("{label} hook `{cmd}` exited with {s}");
+                            }
+                        }
+                        Err(e) => log::warn!("{label} hook `{cmd}`: {e}"),
+                    },
+                    Err(e) => {
+                        log::warn!("could not execute {label} hook `{cmd}`: {e}");
                     }
                 }
-                Err(e) => log::warn!("{label} hook `{cmd}`: {e}"),
             }
+            hook_tasks.borrow_mut().remove(&key);
         });
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 enum HookKind {
     Enter,
     Leave,

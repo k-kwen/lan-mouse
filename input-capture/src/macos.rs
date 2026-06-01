@@ -174,7 +174,6 @@ impl InputCaptureState {
                     "[release-warp] handle_producer_event Release: current_pos={:?} warp_target={warp_target:?}",
                     self.current_pos
                 );
-                release_host_modifiers();
                 self.modifier_state = XMods::empty();
                 if self.current_pos.is_some() {
                     // Warp BEFORE clearing current_pos so the
@@ -240,33 +239,6 @@ impl InputCaptureState {
             }
         };
         Ok(())
-    }
-}
-
-fn release_host_modifiers() {
-    const MODIFIER_KEYCODES: &[u16] = &[
-        0x38, // left shift
-        0x3c, // right shift
-        0x3b, // left control
-        0x3e, // right control
-        0x3a, // left option
-        0x3d, // right option
-        0x37, // left command
-        0x36, // right command
-    ];
-
-    let Ok(event_source) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState) else {
-        log::warn!("failed to create CGEventSource for modifier release");
-        return;
-    };
-
-    for &key in MODIFIER_KEYCODES {
-        let Ok(event) = CGEvent::new_keyboard_event(event_source.clone(), key, false) else {
-            log::warn!("failed to create modifier key-up event for keycode {key}");
-            continue;
-        };
-        event.set_flags(CGEventFlags::empty());
-        event.post(CGEventTapLocation::HID);
     }
 }
 
@@ -547,11 +519,9 @@ fn create_event_tap<'a>(
                 let _ = CGDisplay::show_cursor(&CGDisplay::main());
                 state.current_pos = None;
             }
-            notify_tx
-                .blocking_send(ProducerEvent::EventTapDisabled)
-                .unwrap_or_else(|e| {
-                    log::error!("Failed to send notification: {e}");
-                });
+            if let Err(e) = notify_tx.try_send(ProducerEvent::EventTapDisabled) {
+                log::error!("failed to notify event tap disabled: {e}");
+            }
             return CallbackResult::Keep;
         }
 
@@ -605,9 +575,9 @@ fn create_event_tap<'a>(
                         .start_capture(cg_ev, new_pos)
                         .unwrap_or_else(|e| log::warn!("{e}"));
                     res_events.push(CaptureEvent::Begin { cursor });
-                    notify_tx
-                        .blocking_send(ProducerEvent::Grab(new_pos))
-                        .expect("Failed to send notification");
+                    if let Err(e) = notify_tx.try_send(ProducerEvent::Grab(new_pos)) {
+                        log::warn!("failed to notify capture grab: {e}");
+                    }
                 }
             }
         }
@@ -758,7 +728,7 @@ extern "C" fn display_reconfiguration_callback(_display: u32, flags: u32, user_i
     // freed. The callback only fires while the run loop is running
     // on that thread, so we know the box is live here.
     let sender = unsafe { &*(user_info as *const Sender<ProducerEvent>) };
-    if let Err(e) = sender.blocking_send(ProducerEvent::DisplayReconfigured) {
+    if let Err(e) = sender.try_send(ProducerEvent::DisplayReconfigured) {
         log::warn!("failed to notify display reconfiguration: {e}");
     }
 }

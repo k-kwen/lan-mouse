@@ -23,7 +23,7 @@ use thiserror::Error;
 use tokio::{
     net::UdpSocket,
     sync::Mutex,
-    task::{JoinSet, spawn_local},
+    task::{JoinSet, spawn_blocking, spawn_local},
 };
 use webrtc_dtls::{
     Error as DtlsError,
@@ -480,12 +480,17 @@ async fn connect_to_handle(
         log::info!("client ({handle}) connected @ {addr}");
         if let Some(fingerprint) = expected_fingerprint.as_deref() {
             insert_fingerprint_candidate(&fingerprint_hints, fingerprint, addr.ip());
-            if let Some(path) = last_success_cache_path.as_deref() {
-                if let Err(e) =
-                    discovery::persist_last_success_candidate(path, fingerprint, addr.ip())
-                {
-                    log::warn!("failed to persist last-success candidate to {path:?}: {e}");
-                }
+            if let Some(path) = last_success_cache_path.as_ref() {
+                let path = path.clone();
+                let fingerprint = fingerprint.to_owned();
+                let ip = addr.ip();
+                spawn_blocking(move || {
+                    if let Err(e) =
+                        discovery::persist_last_success_candidate(&path, &fingerprint, ip)
+                    {
+                        log::warn!("failed to persist last-success candidate to {path:?}: {e}");
+                    }
+                });
             }
         }
         client_manager.set_active_addr(handle, Some(addr));
@@ -555,6 +560,7 @@ async fn ping_pong(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn receive_loop(
     client_manager: ClientManager,
     handle: ClientHandle,
@@ -590,7 +596,14 @@ async fn receive_loop(
                     ProtoEvent::Hello { commit } => {
                         client_manager.set_peer_commit(handle, Some(commit));
                     }
-                    event => tx.send((handle, event)).expect("channel closed"),
+                    event => {
+                        if tx.send((handle, event)).is_err() {
+                            log::debug!(
+                                "receive loop for client {handle} @ {addr} stopped: channel closed"
+                            );
+                            break;
+                        }
+                    }
                 }
             }
             // Skip undecodable datagrams without dropping the

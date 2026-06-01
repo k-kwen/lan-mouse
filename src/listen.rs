@@ -329,9 +329,13 @@ fn spawn_accept_task(
                         let certs = dtls_conn.connection_state().await.peer_certificates;
                         let cert = certs.first().expect("cert");
                         let fingerprint = crypto::generate_fingerprint(cert);
-                        listen_tx
+                        if listen_tx
                             .send(ListenEvent::Accept { addr, fingerprint })
-                            .expect("channel closed");
+                            .is_err()
+                        {
+                            log::debug!("listen event channel closed; stopping accept task");
+                            break;
+                        }
                         spawn_local(read_loop(conns.clone(), addr, conn, listen_tx.clone()));
                     }
                     Err(e) => {
@@ -342,9 +346,15 @@ fn spawn_accept_task(
                                         if let Some(fingerprint) =
                                             connection_attempts.lock().expect("lock").pop_front()
                                         {
-                                            listen_tx
+                                            if listen_tx
                                                 .send(ListenEvent::Rejected { fingerprint })
-                                                .expect("channel closed");
+                                                .is_err()
+                                            {
+                                                log::debug!(
+                                                    "listen event channel closed; stopping accept task"
+                                                );
+                                                break;
+                                            }
                                         }
                                     }
                                     _ => log::warn!("accept: {de}"),
@@ -539,9 +549,12 @@ async fn read_loop(
 
     while conn.recv(&mut b).await.is_ok() {
         match b.try_into() {
-            Ok(event) => dtls_tx
-                .send(ListenEvent::Msg { event, addr })
-                .expect("channel closed"),
+            Ok(event) => {
+                if dtls_tx.send(ListenEvent::Msg { event, addr }).is_err() {
+                    log::debug!("listen event channel closed; stopping read loop for {addr}");
+                    break;
+                }
+            }
             Err(e) => {
                 // Skip the malformed/unknown datagram and keep
                 // listening. Each DTLS recv returns one full
@@ -558,10 +571,8 @@ async fn read_loop(
     }
     log::info!("dtls client disconnected {addr:?}");
     let mut conns = conns.lock().await;
-    let index = conns
-        .iter()
-        .position(|(a, _)| *a == addr)
-        .expect("connection not found");
-    conns.remove(index);
+    if let Some(index) = conns.iter().position(|(a, _)| *a == addr) {
+        conns.remove(index);
+    }
     Ok(())
 }

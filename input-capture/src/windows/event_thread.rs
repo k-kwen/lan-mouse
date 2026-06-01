@@ -147,6 +147,8 @@ thread_local! {
     static HELD_MODIFIERS: RefCell<HashSet<Linux>> = RefCell::new(HashSet::new());
 }
 
+static AUTO_RELEASE_BLOCKING_SEND_PENDING: AtomicBool = AtomicBool::new(false);
+
 fn get_msg() -> Option<MSG> {
     unsafe {
         let mut msg = std::mem::zeroed();
@@ -437,11 +439,16 @@ fn dispatch_auto_release(pos: Position) {
         match tx.try_send(event) {
             Ok(()) => {}
             Err(TrySendError::Full(event)) => {
+                if AUTO_RELEASE_BLOCKING_SEND_PENDING.swap(true, Ordering::AcqRel) {
+                    log::debug!("forced capture release already pending; dropping duplicate");
+                    return;
+                }
                 let tx = tx.clone();
                 thread::spawn(move || {
                     if let Err(e) = tx.blocking_send(event) {
                         log::warn!("failed to queue forced capture release: {e}");
                     }
+                    AUTO_RELEASE_BLOCKING_SEND_PENDING.store(false, Ordering::Release);
                 });
             }
             Err(TrySendError::Closed(_)) => {
@@ -536,6 +543,7 @@ unsafe extern "system" fn window_proc(
         match wparam.0 as u32 {
             WTS_SESSION_LOCK => {
                 HOST_LOCKED.set(true);
+                flush_held_modifiers_to_os();
                 if let Some(pos) = ACTIVE_CLIENT.take() {
                     log::info!("host session locked mid-capture; releasing");
                     let _ = try_send_event(pos, CaptureEvent::AutoRelease);

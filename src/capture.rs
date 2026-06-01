@@ -17,7 +17,7 @@ use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
 
-use crate::connect::LanMouseConnection;
+use crate::connect::{LanMouseConnection, LanMouseConnectionError};
 
 const CAPTURE_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(1);
 const CAPTURE_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
@@ -548,6 +548,14 @@ impl CaptureTask {
 
         if let Err(e) = self.conn.send(proto_event, handle).await {
             const DUR: Duration = Duration::from_millis(500);
+            if matches!(e, LanMouseConnectionError::TargetEmulationDisabled) {
+                debounce!(
+                    PREV_LOG,
+                    DUR,
+                    log::debug!("dropping captured input for client {handle}: {e}")
+                );
+                return Ok(());
+            }
             debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
             capture.release().await?;
             return Ok(());

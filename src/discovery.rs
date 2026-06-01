@@ -118,10 +118,7 @@ pub(crate) fn normalize_mdns_name(s: &str) -> String {
 }
 
 pub(crate) fn is_usable_candidate_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V6(ip) if ip.is_unicast_link_local() => false,
-        _ => true,
-    }
+    !matches!(ip, IpAddr::V6(ip) if ip.is_unicast_link_local())
 }
 
 /// Shared `peer_hostname -> primary_ipv4` map, populated by Discovery
@@ -563,18 +560,18 @@ fn start_browse(
                     primary_cache.borrow_mut().insert(key, ip);
                     if let Some(fingerprint) = normalized_fingerprint {
                         if !fingerprint.is_empty() {
-                            let mut candidates = resolved
+                            for candidate in resolved
                                 .get_addresses()
                                 .iter()
                                 .map(|addr| addr.to_ip_addr())
-                                .filter(|ip| is_usable_candidate_ip(*ip))
-                                .collect::<HashSet<_>>();
-                            if is_usable_candidate_ip(ip) {
-                                candidates.insert(ip);
+                            {
+                                insert_fingerprint_candidate(
+                                    &fingerprint_cache,
+                                    &fingerprint,
+                                    candidate,
+                                );
                             }
-                            fingerprint_cache
-                                .borrow_mut()
-                                .insert(fingerprint, candidates);
+                            insert_fingerprint_candidate(&fingerprint_cache, &fingerprint, ip);
                         }
                     }
                 }

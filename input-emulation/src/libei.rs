@@ -169,7 +169,7 @@ impl Emulation for LibeiEmulation {
     ) -> Result<(), EmulationError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_micros() as u64;
         if self.libei_error.load(Ordering::SeqCst) {
             // don't break sending additional events but signal error
@@ -274,7 +274,7 @@ impl Emulation for LibeiEmulation {
     async fn warp_cursor(&mut self, x: i32, y: i32) -> Result<(), EmulationError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_micros() as u64;
         let pointer_abs = self.devices.pointer_abs.read().unwrap();
         if let Some((device, pointer_abs)) = pointer_abs.as_ref() {
