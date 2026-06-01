@@ -331,10 +331,6 @@ impl InputCapture {
                 self.virtual_cursor =
                     Some(((sx + mx).clamp(0.0, peer_w), (sy + my).clamp(0.0, peer_h)));
                 self.pending_motion = (0.0, 0.0);
-                log::info!(
-                    "[bootstrap] seeded virtual_cursor={:?} after late peer_bounds at {pos} (drained pending_motion=({mx:.1}, {my:.1}))",
-                    self.virtual_cursor
-                );
             }
         }
     }
@@ -581,10 +577,6 @@ impl InputCapture {
                     (None, _) => {
                         self.pending_motion.0 += *dx;
                         self.pending_motion.1 += *dy;
-                        log::debug!(
-                            "[wp-motion] deferred dx={dx:.1} dy={dy:.1} (peer_bounds for {active_pos}: {:?})",
-                            self.peer_bounds.get(&active_pos).copied(),
-                        );
                     }
                     _ => {}
                 }
