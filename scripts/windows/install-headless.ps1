@@ -42,6 +42,31 @@ function Quote-TaskArgument {
     }
 }
 
+function Escape-VbsString {
+    param([Parameter(Mandatory = $true)][string] $Value)
+    $Value.Replace('"', '""')
+}
+
+function Write-HiddenLauncher {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][string] $ExePath,
+        [Parameter(Mandatory = $true)][string] $LogPath
+    )
+
+    $vbsExe = Escape-VbsString $ExePath
+    $vbsLog = Escape-VbsString $LogPath
+    @(
+        "Option Explicit",
+        "Dim shell, exe, log, cmd",
+        "Set shell = CreateObject(""WScript.Shell"")",
+        ('exe = "{0}"' -f $vbsExe),
+        ('log = "{0}"' -f $vbsLog),
+        'cmd = Chr(34) & exe & Chr(34) & " --log-file " & Chr(34) & log & Chr(34) & " --log-level info run"',
+        "WScript.Quit shell.Run(cmd, 0, True)"
+    ) | Set-Content -LiteralPath $Path -Encoding ASCII
+}
+
 function Require-File {
     param([Parameter(Mandatory = $true)][string] $Path)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
@@ -89,6 +114,25 @@ if ($PSCmdlet.ShouldProcess($InstallDir, "Install lan-mouse headless runtime")) 
             }
         } |
         Stop-Process -Force -ErrorAction SilentlyContinue
+    $StopDeadline = (Get-Date).AddSeconds(10)
+    do {
+        $InstalledProcesses = @(Get-Process -Name "lan-mouse" -ErrorAction SilentlyContinue |
+            Where-Object {
+                try {
+                    $_.Path -eq $ExeDest
+                } catch {
+                    $false
+                }
+            })
+        if ($InstalledProcesses.Count -eq 0) {
+            break
+        }
+        Start-Sleep -Milliseconds 200
+    } while ((Get-Date) -lt $StopDeadline)
+    if ($InstalledProcesses.Count -ne 0) {
+        $ProcessIds = ($InstalledProcesses | ForEach-Object { $_.Id }) -join ", "
+        throw "Installed lan-mouse.exe is still running and blocks reinstall. PIDs: $ProcessIds"
+    }
 
     Copy-Item -LiteralPath $ExePath -Destination $ExeDest -Force
 
@@ -151,13 +195,13 @@ if ($PSCmdlet.ShouldProcess($InstallDir, "Install lan-mouse headless runtime")) 
     }
 
     Remove-Item -LiteralPath $DaemonBat -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $LauncherVbs -Force -ErrorAction SilentlyContinue
 
-    $RunArgsList = @("--log-file", $LogPath, "--log-level", "info", "run")
-    $RunArgs = ($RunArgsList | ForEach-Object { Quote-TaskArgument $_ }) -join " "
+    $WScriptPath = Join-Path $env:SystemRoot "System32\wscript.exe"
+    Require-File $WScriptPath
+    Write-HiddenLauncher -Path $LauncherVbs -ExePath $ExeDest -LogPath $LogPath
 
     if (-not $NoTask) {
-        $Action = New-ScheduledTaskAction -Execute $ExeDest -Argument $RunArgs
+        $Action = New-ScheduledTaskAction -Execute $WScriptPath -Argument (Quote-TaskArgument $LauncherVbs)
         $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
         $Settings = New-ScheduledTaskSettingsSet `
             -AllowStartIfOnBatteries `
@@ -180,7 +224,7 @@ if ($PSCmdlet.ShouldProcess($InstallDir, "Install lan-mouse headless runtime")) 
             Start-Sleep -Seconds 2
         }
     } elseif (-not $NoStart) {
-        Start-Process -FilePath $ExeDest -ArgumentList $RunArgsList -WindowStyle Hidden
+        Start-Process -FilePath $WScriptPath -ArgumentList (Quote-TaskArgument $LauncherVbs) -WindowStyle Hidden
         Start-Sleep -Seconds 2
     }
 

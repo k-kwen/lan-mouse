@@ -6,8 +6,9 @@ They are intended to be bundled with `lan-mouse.exe` in
 
 The installer delegates peer setup to `lan-mouse.exe pair`, so the config is
 written by the Rust binary, not by hand-built PowerShell TOML.
-The scheduled task runs `lan-mouse.exe --log-file ... run` directly; the old
-VBS/BAT launcher chain is removed during install.
+The scheduled task runs `wscript.exe` with a hidden VBS launcher, which keeps
+the long-running `lan-mouse.exe --log-file ... run` daemon alive without a
+visible console window.
 
 ## Install
 
@@ -75,6 +76,7 @@ Add `-RemoveConfig` to also remove `%LOCALAPPDATA%\lan-mouse`.
 ## Generated files
 
 - `%LOCALAPPDATA%\Programs\LanMouse\lan-mouse.exe`
+- `%LOCALAPPDATA%\Programs\LanMouse\lan-mouse-hidden.vbs`
 - `%LOCALAPPDATA%\lan-mouse\config.toml`
 - `%LOCALAPPDATA%\lan-mouse\daemon.log`
 - Scheduled task: `LanMouse`
