@@ -13,10 +13,7 @@ use thiserror::Error;
 use crate::{
     config::{Config, ConfigClient},
     crypto::normalize_fingerprint,
-    discovery::{
-        SERVICE_TYPE, TXT_FINGERPRINT_KEY, TXT_PRIMARY_KEY, instance_from_fullname,
-        strip_trailing_dot,
-    },
+    discovery::{SERVICE_TYPE, resolved_mdns_peer},
 };
 use lan_mouse_ipc::{ActionTrigger, ClientAction, DEFAULT_PORT, Position};
 
@@ -249,35 +246,16 @@ async fn discover(timeout: Duration) -> Result<Vec<DiscoveredPeer>, PairingError
         };
         match event {
             Ok(ServiceEvent::ServiceResolved(resolved)) => {
-                let instance =
-                    instance_from_fullname(resolved.get_fullname(), SERVICE_TYPE).to_owned();
-                let hostname = strip_trailing_dot(resolved.get_hostname()).to_owned();
-                let fingerprint = resolved
-                    .get_property_val_str(TXT_FINGERPRINT_KEY)
-                    .map(normalize_fingerprint)
-                    .filter(|fp| !fp.is_empty());
-                let primary = resolved
-                    .get_property_val_str(TXT_PRIMARY_KEY)
-                    .and_then(|value| value.parse::<IpAddr>().ok());
-                let mut addresses = resolved
-                    .get_addresses()
-                    .iter()
-                    .map(|addr| addr.to_ip_addr())
-                    .collect::<Vec<_>>();
-                if let Some(primary) = primary {
-                    addresses.push(primary);
-                }
-                addresses.sort();
-                addresses.dedup();
+                let peer = resolved_mdns_peer(&resolved);
                 peers.insert(
-                    resolved.get_fullname().to_owned(),
+                    peer.fullname,
                     DiscoveredPeer {
-                        instance,
-                        hostname,
-                        port: resolved.get_port(),
-                        fingerprint,
-                        primary,
-                        addresses,
+                        instance: peer.instance,
+                        hostname: peer.hostname,
+                        port: peer.port,
+                        fingerprint: peer.fingerprint,
+                        primary: peer.primary,
+                        addresses: peer.addresses,
                     },
                 );
             }

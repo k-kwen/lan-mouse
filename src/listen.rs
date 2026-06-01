@@ -532,7 +532,10 @@ fn spawn_supervisor_task(
                     Err(e) => log::debug!("if_watch error: {e}"),
                 },
                 p = request_port_change_rx.recv() => {
-                    let new_port = p.expect("channel closed");
+                    let Some(new_port) = p else {
+                        log::debug!("port change channel closed; stopping listener supervisor");
+                        break;
+                    };
                     listeners.clear(); // Drop aborts each accept task
                     let mut bound = 0usize;
                     let addrs = enumerate_listenable_ipv4();
@@ -552,14 +555,19 @@ fn spawn_supervisor_task(
                         }
                     }
                     if bound == 0 {
-                        port_changed_tx
+                        if port_changed_tx
                             .send(Err(ListenerCreationError::NoBoundListener))
-                            .expect("channel closed");
+                            .is_err()
+                        {
+                            log::debug!("port changed channel closed; stopping listener supervisor");
+                            break;
+                        }
                     } else {
                         port = new_port;
-                        port_changed_tx
-                            .send(Ok(port))
-                            .expect("channel closed");
+                        if port_changed_tx.send(Ok(port)).is_err() {
+                            log::debug!("port changed channel closed; stopping listener supervisor");
+                            break;
+                        }
                     }
                 }
             }

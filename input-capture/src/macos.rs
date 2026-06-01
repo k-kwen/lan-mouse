@@ -26,7 +26,6 @@ use libc::c_void;
 use once_cell::unsync::Lazy;
 use std::{
     collections::HashSet,
-    ffi::{CString, c_char},
     pin::Pin,
     sync::{Arc, OnceLock},
     task::{Context, Poll, ready},
@@ -199,10 +198,6 @@ impl InputCaptureState {
         log::debug!("handling event: {producer_event:?}");
         match producer_event {
             ProducerEvent::Release { warp_target } => {
-                log::info!(
-                    "[release-warp] handle_producer_event Release: current_pos={:?} warp_target={warp_target:?}",
-                    self.current_pos
-                );
                 self.modifier_state = XMods::empty();
                 if self.current_pos.is_some() {
                     // Warp BEFORE clearing current_pos so the
@@ -211,12 +206,11 @@ impl InputCaptureState {
                     // make it visible again. Then show_cursor() reveals
                     // it at the warped point.
                     if let Some((x, y)) = warp_target {
-                        log::info!("[release-warp] warping local cursor to ({x}, {y})");
                         if let Err(e) = CGDisplay::warp_mouse_cursor_position(CGPoint {
                             x: x as CGFloat,
                             y: y as CGFloat,
                         }) {
-                            log::warn!("[release-warp] warp_mouse_cursor_position failed: {e:?}");
+                            log::warn!("warp_mouse_cursor_position failed: {e:?}");
                         }
                     }
                     self.show_cursor()?;
@@ -716,12 +710,8 @@ fn event_tap_thread(
 /// amortized cost is negligible (<2% CPU at typical mouse rates).
 fn is_screen_locked() -> bool {
     let key = unsafe {
-        let cstr = CString::new("CGSSessionScreenIsLocked").unwrap();
-        CFStringCreateWithCString(
-            kCFAllocatorDefault,
-            cstr.as_ptr() as *const c_char,
-            kCFStringEncodingUTF8,
-        )
+        let cstr = c"CGSSessionScreenIsLocked";
+        CFStringCreateWithCString(kCFAllocatorDefault, cstr.as_ptr(), kCFStringEncodingUTF8)
     };
     let dict = unsafe { CGSessionCopyCurrentDictionary() };
     if dict.is_null() {
@@ -886,7 +876,6 @@ impl Capture for MacOSInputCapture {
     }
 
     async fn release(&mut self, warp_target: Option<(i32, i32)>) -> Result<(), CaptureError> {
-        log::info!("[release-warp] macOS backend release(warp_target={warp_target:?})");
         let notify_tx = self.notify_tx.clone();
         tokio::task::spawn_local(async move {
             log::debug!("notifying Release");
@@ -986,12 +975,9 @@ unsafe fn configure_cf_settings() -> Result<(), MacosCaptureCreationError> {
 
     // This is a private settings that allows the cursor to be hidden while in the background.
     // It is used by Barrier and other apps.
-    let key = CString::new("SetsCursorInBackground").unwrap();
-    let cf_key = CFStringCreateWithCString(
-        kCFAllocatorDefault,
-        key.as_ptr() as *const c_char,
-        kCFStringEncodingUTF8,
-    );
+    let key = c"SetsCursorInBackground";
+    let cf_key =
+        CFStringCreateWithCString(kCFAllocatorDefault, key.as_ptr(), kCFStringEncodingUTF8);
     if CGSSetConnectionProperty(
         _CGSDefaultConnection(),
         _CGSDefaultConnection(),

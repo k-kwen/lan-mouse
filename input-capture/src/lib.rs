@@ -276,14 +276,6 @@ impl InputCapture {
         let warp_target = self
             .capture_pos
             .and_then(|pos| self.host_warp_target_on_release(pos));
-        log::info!(
-            "[release-warp] capture_pos={:?} virtual_cursor={:?} peer_bounds={:?} display_bounds={:?} → warp_target={warp_target:?}",
-            self.capture_pos,
-            self.virtual_cursor,
-            self.capture_pos
-                .and_then(|p| self.peer_bounds.get(&p).copied()),
-            self.capture.display_bounds(),
-        );
         self.pressed_keys.clear();
         self.reset_wall_press_state();
         self.capture.release(warp_target).await
@@ -298,10 +290,6 @@ impl InputCapture {
     /// with whatever position Linux *thought* the peer's cursor was
     /// at before the user moved it.
     pub async fn release_no_host_warp(&mut self) -> Result<(), CaptureError> {
-        log::info!(
-            "[release-warp] handover release: capture_pos={:?} — skipping host warp, peer's CursorPos is authoritative",
-            self.capture_pos,
-        );
         self.pressed_keys.clear();
         self.reset_wall_press_state();
         self.capture.release(None).await

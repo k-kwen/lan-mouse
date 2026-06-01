@@ -1,16 +1,18 @@
 use crate::capture_test::TestCaptureArgs;
 use crate::crypto::normalize_fingerprint;
 use crate::emulation_test::TestEmulationArgs;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use notify::{EventKind, RecommendedWatcher, Watcher};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env::{self, VarError};
+use std::ffi::OsString;
 use std::fmt::Display;
 use std::fs::{self, File};
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Once;
 use std::{collections::HashSet, io};
 use thiserror::Error;
 use toml;
@@ -34,6 +36,15 @@ shadow!(build);
 /// well-formed on the wire.
 pub fn local_commit() -> [u8; 8] {
     let bytes = build::SHORT_COMMIT.as_bytes();
+    if bytes.len() != 8 {
+        static WARN_UNEXPECTED_COMMIT_LEN: Once = Once::new();
+        WARN_UNEXPECTED_COMMIT_LEN.call_once(|| {
+            log::warn!(
+                "unexpected SHORT_COMMIT length {}; protocol hello will use padded/truncated value",
+                bytes.len()
+            );
+        });
+    }
     let mut out = [b'?'; 8];
     let n = bytes.len().min(8);
     out[..n].copy_from_slice(&bytes[..n]);
@@ -108,13 +119,8 @@ impl ConfigToml {
 #[derive(Parser, Debug)]
 #[command(author, version=build::CLAP_LONG_VERSION, about, long_about = None)]
 struct Args {
-    /// write logs to this file instead of stderr
-    #[arg(long = "log-file", global = true, value_name = "PATH")]
-    _log_file: Option<PathBuf>,
-
-    /// override log level (also available via LAN_MOUSE_LOG_LEVEL)
-    #[arg(long = "log-level", global = true)]
-    _log_level: Option<String>,
+    #[command(flatten)]
+    _log: LogArgs,
 
     /// the listen port for lan-mouse
     #[arg(short, long)]
@@ -139,6 +145,54 @@ struct Args {
     /// subcommands
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, ClapArgs)]
+pub struct LogArgs {
+    /// write logs to this file instead of stderr
+    #[arg(long = "log-file", global = true, value_name = "PATH")]
+    log_file: Option<PathBuf>,
+
+    /// override log level (also available via LAN_MOUSE_LOG_LEVEL)
+    #[arg(long = "log-level", global = true)]
+    log_level: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LogOptions {
+    pub file: Option<PathBuf>,
+    pub level: Option<String>,
+}
+
+impl LogArgs {
+    pub fn options_from_env_and_args() -> LogOptions {
+        let file = arg_value("--log-file")
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("LAN_MOUSE_LOG_FILE").map(PathBuf::from));
+        let level = arg_value("--log-level")
+            .and_then(|v| v.into_string().ok())
+            .or_else(|| env::var("LAN_MOUSE_LOG_LEVEL").ok());
+        LogOptions { file, level }
+    }
+}
+
+fn arg_value(name: &str) -> Option<OsString> {
+    let mut args = env::args_os().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == name {
+            return args.next();
+        }
+        if let Some(value) = split_inline_arg(&arg, name) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn split_inline_arg(arg: &OsString, name: &str) -> Option<OsString> {
+    let arg = arg.to_str()?;
+    let (key, value) = arg.split_once('=')?;
+    (key == name).then(|| OsString::from(value))
 }
 
 #[derive(Subcommand, Clone, Debug, Eq, PartialEq)]
@@ -676,6 +730,23 @@ impl Config {
 mod tests {
     use super::*;
     use lan_mouse_ipc::{ActionTrigger, ClientAction};
+    use std::ffi::OsString;
+
+    #[test]
+    fn split_inline_arg_accepts_exact_match() {
+        assert_eq!(
+            split_inline_arg(&OsString::from("--log-file=daemon.log"), "--log-file"),
+            Some(OsString::from("daemon.log"))
+        );
+    }
+
+    #[test]
+    fn split_inline_arg_rejects_prefix_match() {
+        assert_eq!(
+            split_inline_arg(&OsString::from("--log-file-extra=daemon.log"), "--log-file"),
+            None
+        );
+    }
 
     #[test]
     fn parses_ddc_vcp_client_action() {

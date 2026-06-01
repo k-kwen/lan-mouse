@@ -36,9 +36,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
 use serde::{Deserialize, Serialize};
-use tokio::task::{JoinHandle, spawn_local};
+use tokio::task::{JoinHandle, spawn_blocking, spawn_local};
 
 use crate::crypto::normalize_fingerprint;
 
@@ -54,9 +54,14 @@ const LAST_SUCCESS_TTL: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 /// say "use Ethernet, not Wi-Fi". On Linux it reflects the lowest-
 /// metric default route. On Windows it's whatever
 /// `GetBestRoute2` selects.
-fn primary_ipv4() -> Option<Ipv4Addr> {
-    let iface = netdev::get_default_interface().ok()?;
-    iface.ipv4.first().map(|net| net.addr())
+async fn primary_ipv4() -> Option<Ipv4Addr> {
+    spawn_blocking(|| {
+        let iface = netdev::get_default_interface().ok()?;
+        iface.ipv4.first().map(|net| net.addr())
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 fn local_hostname() -> String {
@@ -119,6 +124,48 @@ pub(crate) fn normalize_mdns_name(s: &str) -> String {
 
 pub(crate) fn is_usable_candidate_ip(ip: IpAddr) -> bool {
     !matches!(ip, IpAddr::V6(ip) if ip.is_unicast_link_local())
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedMdnsPeer {
+    pub(crate) fullname: String,
+    pub(crate) instance: String,
+    pub(crate) hostname: String,
+    pub(crate) port: u16,
+    pub(crate) fingerprint: Option<String>,
+    pub(crate) primary: Option<IpAddr>,
+    pub(crate) addresses: Vec<IpAddr>,
+}
+
+pub(crate) fn resolved_mdns_peer(resolved: &ResolvedService) -> ResolvedMdnsPeer {
+    let primary = resolved
+        .get_property_val_str(TXT_PRIMARY_KEY)
+        .and_then(|value| value.parse::<IpAddr>().ok())
+        .filter(|ip| is_usable_candidate_ip(*ip));
+    let fingerprint = resolved
+        .get_property_val_str(TXT_FINGERPRINT_KEY)
+        .map(normalize_fingerprint)
+        .filter(|fp| !fp.is_empty());
+    let mut addresses = resolved
+        .get_addresses()
+        .iter()
+        .map(|addr| addr.to_ip_addr())
+        .filter(|ip| is_usable_candidate_ip(*ip))
+        .collect::<Vec<_>>();
+    if let Some(primary) = primary {
+        addresses.push(primary);
+    }
+    addresses.sort();
+    addresses.dedup();
+    ResolvedMdnsPeer {
+        fullname: resolved.get_fullname().to_owned(),
+        instance: instance_from_fullname(resolved.get_fullname(), SERVICE_TYPE).to_owned(),
+        hostname: strip_trailing_dot(resolved.get_hostname()).to_owned(),
+        port: resolved.get_port(),
+        fingerprint,
+        primary,
+        addresses,
+    }
 }
 
 /// Shared `peer_hostname -> primary_ipv4` map, populated by Discovery
@@ -306,7 +353,7 @@ impl Discovery {
     /// other process, or the OS lacks the permissions). In both
     /// cases we log a warning and continue without discovery; the
     /// dialer falls back to plain hostname resolution.
-    pub(crate) fn new(
+    pub(crate) async fn new(
         port: u16,
         enabled: bool,
         primary_cache: PrimaryCache,
@@ -336,7 +383,7 @@ impl Discovery {
                     browse_task,
                     port,
                 };
-                this.register();
+                this.register().await;
                 this
             }
             Err(e) => {
@@ -368,13 +415,13 @@ impl Discovery {
     /// Register `_lan-mouse._udp.local.` with our hostname + primary
     /// IP. Called on construction and again whenever the primary IP
     /// or port may have changed.
-    fn register(&mut self) {
+    async fn register(&mut self) {
         let Some(daemon) = self.daemon.as_ref() else {
             return;
         };
         let host = local_hostname();
         let host_record = format!("{host}.local.");
-        let primary = match primary_ipv4() {
+        let primary = match primary_ipv4().await {
             Some(ip) => ip,
             None => {
                 log::warn!(
@@ -440,23 +487,23 @@ impl Discovery {
     /// by the service's main loop so the TXT record reflects the
     /// active default-route interface even when interface changes
     /// don't arrive through if-watch.
-    pub(crate) fn refresh(&mut self) {
-        self.register();
+    pub(crate) async fn refresh(&mut self) {
+        self.register().await;
     }
 
     /// Re-register with a new port (config changed).
-    pub(crate) fn set_port(&mut self, port: u16) {
+    pub(crate) async fn set_port(&mut self, port: u16) {
         if self.port == port {
             return;
         }
         self.port = port;
-        self.refresh();
+        self.refresh().await;
     }
 
     /// Toggle the subsystem on/off. Off → unregister, abort browse,
     /// drop daemon. On → spin up afresh, reusing the same shared
     /// cache so any prior hints stay queryable until overwritten.
-    pub(crate) fn set_enabled(&mut self, enabled: bool) {
+    pub(crate) async fn set_enabled(&mut self, enabled: bool) {
         let currently = self.daemon.is_some();
         if currently == enabled {
             return;
@@ -468,7 +515,8 @@ impl Discovery {
                 self.primary_cache.clone(),
                 self.fingerprint_cache.clone(),
                 self.local_fingerprint.clone(),
-            );
+            )
+            .await;
         } else {
             self.shutdown();
         }
@@ -521,57 +569,42 @@ fn start_browse(
         while let Ok(event) = receiver.recv_async().await {
             match event {
                 ServiceEvent::ServiceResolved(resolved) => {
-                    let Some(primary_str) = resolved.get_property_val_str(TXT_PRIMARY_KEY) else {
+                    let peer = resolved_mdns_peer(&resolved);
+                    let Some(ip) = peer.primary else {
                         continue;
                     };
-                    let Ok(ip) = primary_str.parse::<IpAddr>() else {
-                        log::debug!(
-                            "mdns: peer {} advertised malformed primary={primary_str:?}",
-                            resolved.get_fullname()
-                        );
-                        continue;
-                    };
-                    let instance = instance_from_fullname(resolved.get_fullname(), SERVICE_TYPE);
-                    let key = normalize_mdns_name(instance);
-                    let target = strip_trailing_dot(resolved.get_hostname());
-                    let fingerprint = resolved.get_property_val_str(TXT_FINGERPRINT_KEY);
-                    let normalized_fingerprint = fingerprint.map(normalize_fingerprint);
-                    if normalized_fingerprint.as_deref() == Some(local_fingerprint.as_str())
-                        || (key == local_name && normalize_mdns_name(target) == local_name)
+                    let key = normalize_mdns_name(&peer.instance);
+                    if peer.fingerprint.as_deref() == Some(local_fingerprint.as_str())
+                        || (key == local_name && normalize_mdns_name(&peer.hostname) == local_name)
                     {
                         log::debug!("mdns: ignoring our own service announcement {key}");
                         continue;
                     }
-                    let signature = (ip, resolved.get_port(), normalized_fingerprint.clone());
+                    let signature = (ip, peer.port, peer.fingerprint.clone());
                     let first_or_changed = seen_services.get(&key) != Some(&signature);
                     if first_or_changed {
                         log::info!(
                             "mdns: peer instance={key} (target={target}) announces primary={ip} \
                              (port={port}, fp={fingerprint:?})",
-                            port = resolved.get_port(),
+                            target = peer.hostname.as_str(),
+                            port = peer.port,
+                            fingerprint = peer.fingerprint.as_deref(),
                         );
                     } else {
                         log::debug!(
                             "mdns: peer instance={key} refresh primary={ip} (port={port})",
-                            port = resolved.get_port(),
+                            port = peer.port,
                         );
                     }
                     seen_services.insert(key.clone(), signature);
                     primary_cache.borrow_mut().insert(key, ip);
-                    if let Some(fingerprint) = normalized_fingerprint {
-                        if !fingerprint.is_empty() {
-                            for candidate in resolved
-                                .get_addresses()
-                                .iter()
-                                .map(|addr| addr.to_ip_addr())
-                            {
-                                insert_fingerprint_candidate(
-                                    &fingerprint_cache,
-                                    &fingerprint,
-                                    candidate,
-                                );
-                            }
-                            insert_fingerprint_candidate(&fingerprint_cache, &fingerprint, ip);
+                    if let Some(fingerprint) = peer.fingerprint {
+                        for candidate in peer.addresses {
+                            insert_fingerprint_candidate(
+                                &fingerprint_cache,
+                                &fingerprint,
+                                candidate,
+                            );
                         }
                     }
                 }

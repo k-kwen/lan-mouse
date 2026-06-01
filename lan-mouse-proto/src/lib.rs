@@ -121,25 +121,23 @@ impl Display for ProtoEvent {
 #[derive(TryFromPrimitive, IntoPrimitive)]
 #[repr(u8)]
 pub enum EventType {
-    PointerMotion,
-    PointerButton,
-    PointerAxis,
-    PointerAxisValue120,
-    KeyboardKey,
-    KeyboardModifiers,
-    Ping,
-    Pong,
-    Enter,
-    Leave,
-    Ack,
-    Bounds,
-    /// Retired wire id. Kept so newer peers reject old
-    /// MotionAbsolute datagrams instead of reinterpreting this id as
-    /// CursorPos or Hello.
-    MotionAbsolute,
-    CursorPos,
-    Hello,
+    PointerMotion = 0,
+    PointerButton = 1,
+    PointerAxis = 2,
+    PointerAxisValue120 = 3,
+    KeyboardKey = 4,
+    KeyboardModifiers = 5,
+    Ping = 6,
+    Pong = 7,
+    Enter = 8,
+    Leave = 9,
+    Ack = 10,
+    Bounds = 11,
+    CursorPos = 13,
+    Hello = 14,
 }
+
+const RETIRED_MOTION_ABSOLUTE_EVENT_ID: u8 = 12;
 
 impl ProtoEvent {
     fn event_type(&self) -> EventType {
@@ -174,6 +172,9 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
     fn try_from(buf: [u8; MAX_EVENT_SIZE]) -> Result<Self, Self::Error> {
         let mut buf = &buf[..];
         let event_type = decode_u8(&mut buf)?;
+        if event_type == RETIRED_MOTION_ABSOLUTE_EVENT_ID {
+            return Err(ProtocolError::UnsupportedEvent("MotionAbsolute"));
+        }
         match EventType::try_from(event_type)? {
             EventType::PointerMotion => {
                 Ok(Self::Input(InputEvent::Pointer(PointerEvent::Motion {
@@ -222,7 +223,6 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
                 width: decode_u32(&mut buf)?,
                 height: decode_u32(&mut buf)?,
             }),
-            EventType::MotionAbsolute => Err(ProtocolError::UnsupportedEvent("MotionAbsolute")),
             EventType::CursorPos => Ok(Self::CursorPos {
                 pos: decode_u8(&mut buf)?.try_into()?,
                 nx: decode_f32(&mut buf)?,
@@ -365,7 +365,7 @@ mod tests {
     #[test]
     fn legacy_motion_absolute_event_id_is_unsupported() {
         let mut buf = [0u8; MAX_EVENT_SIZE];
-        buf[0] = EventType::MotionAbsolute as u8;
+        buf[0] = RETIRED_MOTION_ABSOLUTE_EVENT_ID;
 
         assert!(matches!(
             ProtoEvent::try_from(buf),

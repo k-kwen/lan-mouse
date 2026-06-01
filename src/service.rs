@@ -158,7 +158,8 @@ impl Service {
             primary_cache,
             fingerprint_cache.clone(),
             public_key_fingerprint.clone(),
-        );
+        )
+        .await;
         let service = Self {
             config,
             capture,
@@ -219,13 +220,13 @@ impl Service {
         let mut terminal_error = None;
         loop {
             tokio::select! {
-                request = self.frontend_listener.next() => self.handle_frontend_request(request),
+                request = self.frontend_listener.next() => self.handle_frontend_request(request).await,
                 _ = self.frontend_event_pending.notified() => self.handle_frontend_pending().await,
-                event = self.emulation.event() => self.handle_emulation_event(event),
+                event = self.emulation.event() => self.handle_emulation_event(event).await,
                 event = self.capture.event() => self.handle_capture_event(event),
                 event = self.resolver.event() => self.handle_resolver_event(event),
                 _ = self.config.changed() => self.handle_config_change(),
-                _ = discovery_refresh_tick.tick() => self.discovery.refresh(),
+                _ = discovery_refresh_tick.tick() => self.discovery.refresh().await,
                 _ = health_tick.tick() => {
                     if let Err(e) = self.health_check() {
                         log::error!("{e}");
@@ -257,7 +258,10 @@ impl Service {
         }
     }
 
-    fn handle_frontend_request(&mut self, request: Option<Result<FrontendRequest, IpcError>>) {
+    async fn handle_frontend_request(
+        &mut self,
+        request: Option<Result<FrontendRequest, IpcError>>,
+    ) {
         let request = match request.expect("frontend listener closed") {
             Ok(r) => r,
             Err(e) => return log::error!("error receiving request: {e}"),
@@ -330,7 +334,7 @@ impl Service {
             }
             FrontendRequest::SetMdnsDiscovery(enabled) => {
                 self.config.set_mdns_discovery(enabled);
-                self.discovery.set_enabled(enabled);
+                self.discovery.set_enabled(enabled).await;
                 self.notify_frontend(FrontendEvent::MdnsDiscovery(enabled));
                 self.save_config();
             }
@@ -394,7 +398,7 @@ impl Service {
         }
     }
 
-    fn handle_emulation_event(&mut self, event: EmulationEvent) {
+    async fn handle_emulation_event(&mut self, event: EmulationEvent) {
         match event {
             EmulationEvent::ConnectionAttempt { fingerprint } => {
                 self.notify_frontend(FrontendEvent::ConnectionAttempt { fingerprint });
@@ -425,7 +429,7 @@ impl Service {
             EmulationEvent::PortChanged(port) => match port {
                 Ok(port) => {
                     self.port = port;
-                    self.discovery.set_port(port);
+                    self.discovery.set_port(port).await;
                     self.notify_frontend(FrontendEvent::PortChanged(port, None));
                 }
                 Err(e) => self
@@ -460,6 +464,11 @@ impl Service {
                 if let Some(handle) = handle {
                     self.client_manager.set_peer_commit(handle, Some(commit));
                     self.broadcast_client(handle);
+                } else {
+                    log::debug!(
+                        "peer hello from {addr} did not match a configured client \
+                         (fingerprint={fingerprint:?})"
+                    );
                 }
             }
         }
@@ -811,6 +820,9 @@ impl Service {
                 log::info!("running {label} action: {action:?}");
                 match actions::run(action).await {
                     Ok(()) => log::info!("{label} action completed successfully"),
+                    Err(actions::ActionError::Unsupported) => {
+                        log::debug!("{label} action skipped: DDC/VCP unsupported on this platform")
+                    }
                     Err(e) => log::warn!("{label} action failed: {e}"),
                 }
             }

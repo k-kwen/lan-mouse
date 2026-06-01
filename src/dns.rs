@@ -1,12 +1,15 @@
-use std::{collections::HashMap, io, net::IpAddr};
+use std::{collections::HashMap, io, net::IpAddr, time::Duration};
 
 use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::net::lookup_host;
 use tokio::task::{JoinHandle, spawn_local};
+use tokio::time::timeout;
 
 use tokio_util::sync::CancellationToken;
 
 use lan_mouse_ipc::ClientHandle;
+
+const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) struct DnsResolver {
     cancellation_token: CancellationToken,
@@ -88,9 +91,10 @@ impl DnsTask {
                 }
             }
 
-            self.event_tx
-                .send(DnsEvent::Resolving(handle))
-                .expect("channel closed");
+            if self.event_tx.send(DnsEvent::Resolving(handle)).is_err() {
+                log::debug!("dns event channel closed; stopping resolver task");
+                break;
+            }
 
             /* spawn task for dns request */
             let event_tx = self.event_tx.clone();
@@ -99,9 +103,12 @@ impl DnsTask {
             let task = tokio::task::spawn_local(async move {
                 tokio::select! {
                     result = resolve_hostname(&hostname) => {
-                       event_tx
+                       if event_tx
                            .send(DnsEvent::Resolved(handle, hostname, result))
-                           .expect("channel closed");
+                           .is_err()
+                       {
+                           log::debug!("dns event channel closed; dropping resolve result");
+                       }
                     }
                     _ = cancellation_token.cancelled() => {},
                 }
@@ -122,6 +129,13 @@ impl DnsTask {
 /// only care about the IPs at this stage; the actual port is appended at
 /// connection time.
 async fn resolve_hostname(hostname: &str) -> io::Result<Vec<IpAddr>> {
-    let addrs = lookup_host((hostname, 0)).await?;
+    let addrs = timeout(DNS_LOOKUP_TIMEOUT, lookup_host((hostname, 0)))
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("DNS lookup timed out after {DNS_LOOKUP_TIMEOUT:?}"),
+            )
+        })??;
     Ok(addrs.map(|sa| sa.ip()).collect())
 }

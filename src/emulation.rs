@@ -220,7 +220,10 @@ impl ListenTask {
                             ProtoEvent::Hello { commit } => {
                                 self.listener.reply(addr, ProtoEvent::Hello { commit: local_commit() }).await;
                                 let fingerprint = self.listener.get_certificate_fingerprint(addr).await;
-                                self.event_tx.send(EmulationEvent::PeerHello { addr, fingerprint, commit }).expect("channel closed");
+                                if self.event_tx.send(EmulationEvent::PeerHello { addr, fingerprint, commit }).is_err() {
+                                    log::debug!("emulation event channel closed; dropping peer hello");
+                                    break;
+                                }
                             }
                             // Capturing peer told us where on its own
                             // screen the user's cursor was, as a
@@ -249,14 +252,7 @@ impl ListenTask {
                                         Position::Top => (cx, 0),
                                         Position::Bottom => (cx, phi.saturating_sub(1)),
                                     };
-                                    log::info!(
-                                        "[cursor-pos] recv pos={pos:?} nx={nx:.3} ny={ny:.3} display_bounds=({w},{h}) → warp=({tx},{ty})"
-                                    );
                                     self.emulation_proxy.warp_cursor(tx, ty);
-                                } else {
-                                    log::info!(
-                                        "[cursor-pos] recv pos={pos:?} nx={nx:.3} ny={ny:.3} but display_bounds=None — skipping warp"
-                                    );
                                 }
                             }
                             _ => {}

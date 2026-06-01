@@ -287,6 +287,41 @@ impl InputEmulation {
     }
 }
 
+#[async_trait]
+trait Emulation: Send {
+    async fn consume(
+        &mut self,
+        event: Event,
+        handle: EmulationHandle,
+    ) -> Result<(), EmulationError>;
+    async fn create(&mut self, handle: EmulationHandle);
+    async fn destroy(&mut self, handle: EmulationHandle);
+    async fn terminate(&mut self);
+
+    /// Geometry (width, height) of the union of this device's
+    /// active displays in pixels. Used by the protocol-level
+    /// `Bounds` event so a capturing peer can model the guest
+    /// cursor's position. Backends that can't report geometry
+    /// should leave the default `None` and the wall-press
+    /// auto-release fallback will degrade to "no upper clamp"
+    /// behavior on the host.
+    fn display_bounds(&self) -> Option<(u32, u32)> {
+        None
+    }
+
+    /// Warp the cursor to an absolute position on the receiving
+    /// device's primary display, if the backend supports absolute
+    /// positioning. Called when an `Enter` event arrives so the
+    /// guest cursor lands at the entry edge instead of staying
+    /// wherever the previous capture session left it. Backends
+    /// without absolute positioning can leave the default no-op
+    /// — the wall-press auto-release will be inaccurate but the
+    /// connection still works.
+    async fn warp_cursor(&mut self, _x: i32, _y: i32) -> Result<(), EmulationError> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,40 +395,5 @@ mod tests {
 
         let events = events.lock().unwrap().clone();
         assert_eq!(events, vec![(left_button(1), 7), (left_button(0), 7)]);
-    }
-}
-
-#[async_trait]
-trait Emulation: Send {
-    async fn consume(
-        &mut self,
-        event: Event,
-        handle: EmulationHandle,
-    ) -> Result<(), EmulationError>;
-    async fn create(&mut self, handle: EmulationHandle);
-    async fn destroy(&mut self, handle: EmulationHandle);
-    async fn terminate(&mut self);
-
-    /// Geometry (width, height) of the union of this device's
-    /// active displays in pixels. Used by the protocol-level
-    /// `Bounds` event so a capturing peer can model the guest
-    /// cursor's position. Backends that can't report geometry
-    /// should leave the default `None` and the wall-press
-    /// auto-release fallback will degrade to "no upper clamp"
-    /// behavior on the host.
-    fn display_bounds(&self) -> Option<(u32, u32)> {
-        None
-    }
-
-    /// Warp the cursor to an absolute position on the receiving
-    /// device's primary display, if the backend supports absolute
-    /// positioning. Called when an `Enter` event arrives so the
-    /// guest cursor lands at the entry edge instead of staying
-    /// wherever the previous capture session left it. Backends
-    /// without absolute positioning can leave the default no-op
-    /// — the wall-press auto-release will be inaccurate but the
-    /// connection still works.
-    async fn warp_cursor(&mut self, _x: i32, _y: i32) -> Result<(), EmulationError> {
-        Ok(())
     }
 }
