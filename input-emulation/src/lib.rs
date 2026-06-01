@@ -4,7 +4,7 @@ use std::{
     fmt::Display,
 };
 
-use input_event::{Event, KeyboardEvent};
+use input_event::{Event, KeyboardEvent, PointerEvent};
 
 pub use self::error::{EmulationCreationError, EmulationError, InputEmulationError};
 
@@ -73,6 +73,7 @@ pub struct InputEmulation {
     emulation: Box<dyn Emulation>,
     handles: HashSet<EmulationHandle>,
     pressed_keys: HashMap<EmulationHandle, HashSet<u32>>,
+    pressed_buttons: HashMap<EmulationHandle, HashSet<u32>>,
 }
 
 impl InputEmulation {
@@ -96,6 +97,7 @@ impl InputEmulation {
             emulation,
             handles: HashSet::new(),
             pressed_keys: HashMap::new(),
+            pressed_buttons: HashMap::new(),
         })
     }
 
@@ -149,6 +151,14 @@ impl InputEmulation {
                 }
                 Ok(())
             }
+            Event::Pointer(PointerEvent::Button { button, state, .. }) => {
+                // prevent duplicate mouse button transitions and keep
+                // enough state to release a stuck drag on session end
+                if self.update_pressed_buttons(handle, button, state) {
+                    self.emulation.consume(event, handle).await?;
+                }
+                Ok(())
+            }
             _ => self.emulation.consume(event, handle).await,
         }
     }
@@ -156,6 +166,7 @@ impl InputEmulation {
     pub async fn create(&mut self, handle: EmulationHandle) -> bool {
         if self.handles.insert(handle) {
             self.pressed_keys.insert(handle, HashSet::new());
+            self.pressed_buttons.insert(handle, HashSet::new());
             self.emulation.create(handle).await;
             true
         } else {
@@ -164,9 +175,11 @@ impl InputEmulation {
     }
 
     pub async fn destroy(&mut self, handle: EmulationHandle) {
+        let _ = self.release_buttons(handle).await;
         let _ = self.release_keys(handle).await;
         if self.handles.remove(&handle) {
             self.pressed_keys.remove(&handle);
+            self.pressed_buttons.remove(&handle);
             self.emulation.destroy(handle).await
         }
     }
@@ -217,6 +230,23 @@ impl InputEmulation {
         Ok(())
     }
 
+    pub async fn release_buttons(&mut self, handle: EmulationHandle) -> Result<(), EmulationError> {
+        if let Some(buttons) = self.pressed_buttons.get_mut(&handle) {
+            let buttons = buttons.drain().collect::<Vec<_>>();
+            for button in buttons {
+                let event = Event::Pointer(PointerEvent::Button {
+                    time: 0,
+                    button,
+                    state: 0,
+                });
+                self.emulation.consume(event, handle).await?;
+                log::warn!("releasing stuck mouse button: {button}");
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn has_pressed_keys(&self, handle: EmulationHandle) -> bool {
         self.pressed_keys
             .get(&handle)
@@ -237,6 +267,99 @@ impl InputEmulation {
             // currently not pressed => can press
             pressed_keys.insert(key)
         }
+    }
+
+    /// update the pressed mouse buttons for the given handle
+    /// returns whether the event should be processed
+    fn update_pressed_buttons(&mut self, handle: EmulationHandle, button: u32, state: u32) -> bool {
+        let Some(pressed_buttons) = self.pressed_buttons.get_mut(&handle) else {
+            return false;
+        };
+
+        match state {
+            // currently pressed => can release
+            0 => pressed_buttons.remove(&button),
+            // currently not pressed => can press
+            1 => pressed_buttons.insert(button),
+            // unknown button state: forward it unchanged
+            _ => true,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use input_event::BTN_LEFT;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct RecordingEmulation {
+        events: Arc<Mutex<Vec<(Event, EmulationHandle)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Emulation for RecordingEmulation {
+        async fn consume(
+            &mut self,
+            event: Event,
+            handle: EmulationHandle,
+        ) -> Result<(), EmulationError> {
+            self.events.lock().unwrap().push((event, handle));
+            Ok(())
+        }
+
+        async fn create(&mut self, _handle: EmulationHandle) {}
+        async fn destroy(&mut self, _handle: EmulationHandle) {}
+        async fn terminate(&mut self) {}
+    }
+
+    fn recording_input_emulation(
+        events: Arc<Mutex<Vec<(Event, EmulationHandle)>>>,
+    ) -> InputEmulation {
+        InputEmulation {
+            emulation: Box::new(RecordingEmulation { events }),
+            handles: HashSet::new(),
+            pressed_keys: HashMap::new(),
+            pressed_buttons: HashMap::new(),
+        }
+    }
+
+    fn left_button(state: u32) -> Event {
+        Event::Pointer(PointerEvent::Button {
+            time: 0,
+            button: BTN_LEFT,
+            state,
+        })
+    }
+
+    #[tokio::test]
+    async fn destroy_releases_pressed_pointer_buttons() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut emulation = recording_input_emulation(events.clone());
+
+        emulation.create(7).await;
+        emulation.consume(left_button(1), 7).await.unwrap();
+        emulation.destroy(7).await;
+
+        let events = events.lock().unwrap().clone();
+        assert_eq!(events[0], (left_button(1), 7));
+        assert!(events.contains(&(left_button(0), 7)));
+    }
+
+    #[tokio::test]
+    async fn duplicate_pointer_button_transitions_are_suppressed() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut emulation = recording_input_emulation(events.clone());
+
+        emulation.create(7).await;
+        emulation.consume(left_button(1), 7).await.unwrap();
+        emulation.consume(left_button(1), 7).await.unwrap();
+        emulation.consume(left_button(0), 7).await.unwrap();
+        emulation.consume(left_button(0), 7).await.unwrap();
+
+        let events = events.lock().unwrap().clone();
+        assert_eq!(events, vec![(left_button(1), 7), (left_button(0), 7)]);
     }
 }
 
