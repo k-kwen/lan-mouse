@@ -377,45 +377,10 @@ fn trigger_mission_control() {
     }
 }
 
-/// Toggles the Korean IME by synthesizing a CapsLock press from a
-/// `HIDSystemState` source. Currently inactive — see analysis below: macOS
-/// treats CapsLock as a modifier *flag*, not a key, so a plain keyDown/keyUp
-/// CGEvent doesn't change the lock state even at HID-state priority. Kept
-/// for future experimentation (e.g. paired with a `FlagsChanged`
-/// `CGEventFlagAlphaShift` event).
-#[allow(dead_code)]
-fn toggle_korean_via_capslock() {
-    let source = match CGEventSource::new(CGEventSourceStateID::HIDSystemState) {
-        Ok(s) => s,
-        Err(_) => {
-            log::warn!("toggle_korean_via_capslock: HID source creation failed");
-            return;
-        }
-    };
-    const KEY_CAPSLOCK: u16 = 0x39;
-    if let Ok(e) = CGEvent::new_keyboard_event(source.clone(), KEY_CAPSLOCK, true) {
-        e.post(CGEventTapLocation::HID);
-    } else {
-        log::warn!("toggle_korean_via_capslock: keydown creation failed");
-        return;
-    }
-    if let Ok(e) = CGEvent::new_keyboard_event(source, KEY_CAPSLOCK, false) {
-        e.post(CGEventTapLocation::HID);
-    } else {
-        log::warn!("toggle_korean_via_capslock: keyup creation failed");
-    }
-}
-
 /// Triggers Show Desktop by posting F11 from a `HIDSystemState` CGEventSource,
 /// the event-source state that sits closest to a real HID interrupt. The hope
 /// is that WindowServer's mid-transition reverse handler (which lets native
-/// F11 cancel an in-flight Show Desktop transition) accepts this source. The
-/// AppleScript path we used before is trusted, but its events arrive too high
-/// in the stack to participate in transition-reverse, so the user only gets
-/// the second toggle *after* the first transition finishes.
-///
-/// If the HID-state path turns out to be rejected by the shortcut handler,
-/// swap back to `trigger_show_desktop_via_applescript()` below.
+/// F11 cancel an in-flight Show Desktop transition) accepts this source.
 fn trigger_show_desktop() {
     let source = match CGEventSource::new(CGEventSourceStateID::HIDSystemState) {
         Ok(s) => s,
@@ -438,34 +403,7 @@ fn trigger_show_desktop() {
     }
 }
 
-/// Legacy trigger kept around in case the HID-state path turns out to be
-/// rejected by the system shortcut handler. Routes through NSAppleScript /
-/// osascript (trusted, but high in the stack — no transition-reverse).
-#[allow(dead_code)]
-fn trigger_show_desktop_via_applescript() {
-    std::thread::spawn(|| {
-        const SCRIPT: &str = "tell application \"System Events\" to key code 103";
-        if run_apple_script_in_process(SCRIPT) {
-            return;
-        }
-        log::debug!("trigger_show_desktop: falling back to osascript subprocess");
-        let result = std::process::Command::new("/usr/bin/osascript")
-            .args(["-e", SCRIPT])
-            .status();
-        if let Err(e) = result {
-            log::warn!("trigger_show_desktop: subprocess spawn failed: {e}");
-        }
-    });
-}
-
-// ---- NSAppleScript in-process via Objective-C runtime + dlsym -------------
-//
-// Spawning `osascript` costs 200-300ms (process fork + Apple Event runtime
-// initialization). We can drop that to <10ms by going through Foundation's
-// NSAppleScript class directly. Symbols are resolved at runtime (matching
-// the same dlsym pattern used for the TIS Korean-IME toggle) so we add no
-// new build dependencies. The first call still pays the AppleScript runtime
-// warmup, but subsequent calls are fast.
+// ---- NSAutoreleasePool via Objective-C runtime + dlsym --------------------
 
 type ObjcId = *const c_void;
 type ObjcSel = *const c_void;
@@ -474,33 +412,24 @@ type ObjcClass = *const c_void;
 type FnObjcGetClass = unsafe extern "C" fn(name: *const std::ffi::c_char) -> ObjcClass;
 type FnSelRegisterName = unsafe extern "C" fn(name: *const std::ffi::c_char) -> ObjcSel;
 type FnMsgSend0 = unsafe extern "C" fn(ObjcId, ObjcSel) -> ObjcId;
-type FnMsgSend1 = unsafe extern "C" fn(ObjcId, ObjcSel, ObjcId) -> ObjcId;
-type FnMsgSendErr = unsafe extern "C" fn(ObjcId, ObjcSel, *mut ObjcId) -> ObjcId;
 
-struct AppleScriptApi {
-    nsapplescript_class: ObjcClass,
+struct AutoreleasePoolApi {
     nsautoreleasepool_class: ObjcClass,
     alloc_sel: ObjcSel,
     init_sel: ObjcSel,
-    init_with_source_sel: ObjcSel,
-    execute_sel: ObjcSel,
-    release_sel: ObjcSel,
     drain_sel: ObjcSel,
     msg_send_0: FnMsgSend0,
-    msg_send_1: FnMsgSend1,
-    msg_send_err: FnMsgSendErr,
 }
 
-unsafe impl Send for AppleScriptApi {}
-unsafe impl Sync for AppleScriptApi {}
+unsafe impl Send for AutoreleasePoolApi {}
+unsafe impl Sync for AutoreleasePoolApi {}
 
-static APPLESCRIPT_API: std::sync::OnceLock<Option<AppleScriptApi>> = std::sync::OnceLock::new();
+static AUTORELEASE_POOL_API: std::sync::OnceLock<Option<AutoreleasePoolApi>> =
+    std::sync::OnceLock::new();
 
-fn applescript_api() -> Option<&'static AppleScriptApi> {
-    APPLESCRIPT_API
+fn autorelease_pool_api() -> Option<&'static AutoreleasePoolApi> {
+    AUTORELEASE_POOL_API
         .get_or_init(|| unsafe {
-            // Pull in Foundation so NSAppleScript is in dyld. Failure is
-            // tolerated — Foundation is usually loaded transitively.
             let foundation_path = c"/System/Library/Frameworks/Foundation.framework/Foundation";
             let _foundation = dlopen(foundation_path.as_ptr(), RTLD_LAZY);
 
@@ -508,33 +437,24 @@ fn applescript_api() -> Option<&'static AppleScriptApi> {
             let sel_register = dlsym(RTLD_DEFAULT, c"sel_registerName".as_ptr());
             let msg_send = dlsym(RTLD_DEFAULT, c"objc_msgSend".as_ptr());
             if get_class.is_null() || sel_register.is_null() || msg_send.is_null() {
-                log::warn!("NSAppleScript: objc runtime missing; subprocess fallback only");
+                log::warn!("NSAutoreleasePool: objc runtime missing");
                 return None;
             }
             let get_class: FnObjcGetClass = std::mem::transmute(get_class);
             let sel_register: FnSelRegisterName = std::mem::transmute(sel_register);
             let msg_send_0: FnMsgSend0 = std::mem::transmute(msg_send);
-            let msg_send_1: FnMsgSend1 = std::mem::transmute(msg_send);
-            let msg_send_err: FnMsgSendErr = std::mem::transmute(msg_send);
 
-            let nsapplescript_class = get_class(c"NSAppleScript".as_ptr());
             let nsautoreleasepool_class = get_class(c"NSAutoreleasePool".as_ptr());
-            if nsapplescript_class.is_null() || nsautoreleasepool_class.is_null() {
-                log::warn!("NSAppleScript: required classes not found; subprocess fallback only");
+            if nsautoreleasepool_class.is_null() {
+                log::warn!("NSAutoreleasePool: class not found");
                 return None;
             }
-            Some(AppleScriptApi {
-                nsapplescript_class,
+            Some(AutoreleasePoolApi {
                 nsautoreleasepool_class,
                 alloc_sel: sel_register(c"alloc".as_ptr()),
                 init_sel: sel_register(c"init".as_ptr()),
-                init_with_source_sel: sel_register(c"initWithSource:".as_ptr()),
-                execute_sel: sel_register(c"executeAndReturnError:".as_ptr()),
-                release_sel: sel_register(c"release".as_ptr()),
                 drain_sel: sel_register(c"drain".as_ptr()),
                 msg_send_0,
-                msg_send_1,
-                msg_send_err,
             })
         })
         .as_ref()
@@ -639,7 +559,7 @@ fn post_media_key(key_type: u32, fine_step: bool) {
         log::warn!("post_media_key: API unavailable");
         return;
     };
-    let pool_api = applescript_api();
+    let pool_api = autorelease_pool_api();
     unsafe {
         let pool = pool_api.map(|p| {
             let alloc = (p.msg_send_0)(p.nsautoreleasepool_class, p.alloc_sel);
@@ -686,60 +606,6 @@ fn post_media_key(key_type: u32, fine_step: bool) {
             }
         }
     }
-}
-
-/// Compiles and executes a one-shot AppleScript using NSAppleScript in this
-/// process. Returns `true` on success; `false` if the runtime was unavailable
-/// or the source couldn't be turned into an NSString. AppleScript runtime
-/// errors are logged but still return `true` (we did execute — the script
-/// itself failed).
-fn run_apple_script_in_process(source: &str) -> bool {
-    let Some(api) = applescript_api() else {
-        return false;
-    };
-    let ns_string = cfstring_from(source);
-    if ns_string.is_null() {
-        return false;
-    }
-    unsafe {
-        let pool_alloc = (api.msg_send_0)(api.nsautoreleasepool_class, api.alloc_sel);
-        let pool = if pool_alloc.is_null() {
-            std::ptr::null()
-        } else {
-            (api.msg_send_0)(pool_alloc, api.init_sel)
-        };
-
-        let script_alloc = (api.msg_send_0)(api.nsapplescript_class, api.alloc_sel);
-        if script_alloc.is_null() {
-            if !pool.is_null() {
-                let _ = (api.msg_send_0)(pool, api.drain_sel);
-            }
-            CFRelease(ns_string);
-            return false;
-        }
-        let script = (api.msg_send_1)(script_alloc, api.init_with_source_sel, ns_string as ObjcId);
-        if script.is_null() {
-            if !pool.is_null() {
-                let _ = (api.msg_send_0)(pool, api.drain_sel);
-            }
-            CFRelease(ns_string);
-            log::warn!("NSAppleScript: initWithSource: returned nil");
-            return false;
-        }
-        let mut err: ObjcId = std::ptr::null();
-        let _result = (api.msg_send_err)(script, api.execute_sel, &mut err);
-        let _ = (api.msg_send_0)(script, api.release_sel);
-
-        if !err.is_null() {
-            log::warn!("NSAppleScript: execution returned an error dictionary");
-        }
-
-        if !pool.is_null() {
-            let _ = (api.msg_send_0)(pool, api.drain_sel);
-        }
-        CFRelease(ns_string);
-    }
-    true
 }
 
 fn cfstring_from(s: &str) -> CFStringRef {

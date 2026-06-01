@@ -179,7 +179,7 @@ impl LastSuccessEntry {
             Self::Timed {
                 updated_at_unix, ..
             } => now.saturating_sub(*updated_at_unix) > LAST_SUCCESS_TTL.as_secs(),
-            Self::Legacy(_) => false,
+            Self::Legacy(_) => true,
         }
     }
 }
@@ -651,6 +651,29 @@ mod tests {
             ),
         )
         .expect("write stale cache");
+
+        let cache: FingerprintCache = Default::default();
+        load_last_success_candidates(&cache, &path).expect("load candidates");
+        assert!(cache.borrow().is_empty());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn ignores_legacy_last_success_candidates_without_timestamp() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("lan-mouse-last-success-legacy-{nonce}.toml"));
+        fs::write(
+            &path,
+            r#"
+            [fingerprints]
+            "aa:bb" = ["192.168.10.155"]
+            "#,
+        )
+        .expect("write legacy cache");
 
         let cache: FingerprintCache = Default::default();
         load_last_success_candidates(&cache, &path).expect("load candidates");

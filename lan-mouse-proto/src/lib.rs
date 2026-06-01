@@ -21,6 +21,9 @@ pub enum ProtocolError {
     /// position type does not exist
     #[error("invalid event id: `{0}`")]
     InvalidPosition(#[from] TryFromPrimitiveError<Position>),
+    /// event type is a retired wire variant
+    #[error("unsupported event: `{0}`")]
+    UnsupportedEvent(&'static str),
 }
 
 /// Position of a client
@@ -70,23 +73,12 @@ pub enum ProtoEvent {
     /// height are in pixels of the union of all displays on the
     /// emulating device.
     Bounds { width: u32, height: u32 },
-    /// Absolute cursor warp on the receiving device. Sent by the
-    /// capturing peer after [`ProtoEvent::Enter`] so the guest's
-    /// cursor lands at the position that visually corresponds to
-    /// where the user's physical cursor was at the moment of
-    /// crossing. `x` and `y` are pixel coordinates in the receiver's
-    /// screen space, computed by the capturing peer using its own
-    /// display bounds and the receiver-supplied [`ProtoEvent::Bounds`]
-    /// from a prior Enter.
-    MotionAbsolute { x: i32, y: i32 },
-    /// Self-sufficient counterpart to [`ProtoEvent::MotionAbsolute`].
+    /// Cursor warp on the receiving device.
     /// Carries the host's cursor position normalized to the host's
     /// own display bounds (0..1 along each axis) plus the entry
     /// side from the receiver's frame. The receiver scales nx/ny
-    /// against its own bounds and pins the on-axis dimension to
-    /// the entry edge, eliminating the bootstrap problem where
-    /// MotionAbsolute couldn't be sent on the first crossing
-    /// because the host had no cached peer geometry.
+    /// against its own bounds and pins the on-axis dimension to the
+    /// entry edge.
     CursorPos { pos: Position, nx: f32, ny: f32 },
     /// Build identification for the sending peer. Sent by the
     /// connect side once after the connection authenticates, and
@@ -115,7 +107,6 @@ impl Display for ProtoEvent {
                 )
             }
             ProtoEvent::Bounds { width, height } => write!(f, "Bounds({width}x{height})"),
-            ProtoEvent::MotionAbsolute { x, y } => write!(f, "MotionAbsolute({x}, {y})"),
             ProtoEvent::CursorPos { pos, nx, ny } => {
                 write!(f, "CursorPos({pos}, {nx:.4}, {ny:.4})")
             }
@@ -142,6 +133,9 @@ pub enum EventType {
     Leave,
     Ack,
     Bounds,
+    /// Retired wire id. Kept so newer peers reject old
+    /// MotionAbsolute datagrams instead of reinterpreting this id as
+    /// CursorPos or Hello.
     MotionAbsolute,
     CursorPos,
     Hello,
@@ -168,7 +162,6 @@ impl ProtoEvent {
             ProtoEvent::Leave(_) => EventType::Leave,
             ProtoEvent::Ack(_) => EventType::Ack,
             ProtoEvent::Bounds { .. } => EventType::Bounds,
-            ProtoEvent::MotionAbsolute { .. } => EventType::MotionAbsolute,
             ProtoEvent::CursorPos { .. } => EventType::CursorPos,
             ProtoEvent::Hello { .. } => EventType::Hello,
         }
@@ -229,10 +222,7 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
                 width: decode_u32(&mut buf)?,
                 height: decode_u32(&mut buf)?,
             }),
-            EventType::MotionAbsolute => Ok(Self::MotionAbsolute {
-                x: decode_i32(&mut buf)?,
-                y: decode_i32(&mut buf)?,
-            }),
+            EventType::MotionAbsolute => Err(ProtocolError::UnsupportedEvent("MotionAbsolute")),
             EventType::CursorPos => Ok(Self::CursorPos {
                 pos: decode_u8(&mut buf)?.try_into()?,
                 nx: decode_f32(&mut buf)?,
@@ -313,10 +303,6 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                     encode_u32(buf, len, width);
                     encode_u32(buf, len, height);
                 }
-                ProtoEvent::MotionAbsolute { x, y } => {
-                    encode_i32(buf, len, x);
-                    encode_i32(buf, len, y);
-                }
                 ProtoEvent::CursorPos { pos, nx, ny } => {
                     encode_u8(buf, len, pos as u8);
                     encode_f32(buf, len, nx);
@@ -371,3 +357,19 @@ encode_impl!(u32);
 encode_impl!(i32);
 encode_impl!(f32);
 encode_impl!(f64);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_motion_absolute_event_id_is_unsupported() {
+        let mut buf = [0u8; MAX_EVENT_SIZE];
+        buf[0] = EventType::MotionAbsolute as u8;
+
+        assert!(matches!(
+            ProtoEvent::try_from(buf),
+            Err(ProtocolError::UnsupportedEvent("MotionAbsolute"))
+        ));
+    }
+}
