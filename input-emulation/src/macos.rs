@@ -986,27 +986,29 @@ fn valid_display_bounds(
     Some((min_x, min_y, max_x, max_y))
 }
 
-/// Top-left corner of the union of all active displays, in the global
-/// Quartz coordinate system anchored at the MAIN display's top-left.
-/// NEGATIVE on an axis when a display sits left of / above the main
-/// one. Pairs with the size returned by `display_bounds` so a 0-based
-/// virtual point can be mapped back to an absolute warp target.
-fn display_union_origin() -> (CGFloat, CGFloat) {
-    let Ok(displays) = CGDisplay::active_displays() else {
-        return (0., 0.);
-    };
+/// Union of all active displays as `(origin_x, origin_y, width, height)`
+/// in the global Quartz coordinate system anchored at the MAIN
+/// display's top-left. The origin is negative on an axis when a
+/// display sits left of / above the main one.
+fn active_display_rect() -> Option<(CGFloat, CGFloat, CGFloat, CGFloat)> {
+    let displays = CGDisplay::active_displays().ok()?;
     let mut xmin = f64::INFINITY;
+    let mut xmax = f64::NEG_INFINITY;
     let mut ymin = f64::INFINITY;
+    let mut ymax = f64::NEG_INFINITY;
     for id in displays {
-        let bounds = CGDisplay::new(id).bounds();
-        xmin = xmin.min(bounds.origin.x);
-        ymin = ymin.min(bounds.origin.y);
+        let Some((min_x, min_y, max_x, max_y)) = valid_display_bounds(id) else {
+            continue;
+        };
+        xmin = xmin.min(min_x);
+        xmax = xmax.max(max_x);
+        ymin = ymin.min(min_y);
+        ymax = ymax.max(max_y);
     }
-    if xmin.is_finite() && ymin.is_finite() {
-        (xmin, ymin)
-    } else {
-        (0., 0.)
+    if xmax <= xmin || ymax <= ymin {
+        return None;
     }
+    Some((xmin, ymin, xmax - xmin, ymax - ymin))
 }
 
 fn clamp_to_screen_space(
@@ -1380,22 +1382,7 @@ impl Emulation for MacOSEmulation {
         // Union of every active display's rectangle. Matches the
         // shape used on the input-capture side so the host's
         // wall-press model is consistent across both ends.
-        let displays = CGDisplay::active_displays().ok()?;
-        let mut xmin = f64::INFINITY;
-        let mut xmax = f64::NEG_INFINITY;
-        let mut ymin = f64::INFINITY;
-        let mut ymax = f64::NEG_INFINITY;
-        for id in displays {
-            let bounds = CGDisplay::new(id).bounds();
-            xmin = xmin.min(bounds.origin.x);
-            xmax = xmax.max(bounds.origin.x + bounds.size.width);
-            ymin = ymin.min(bounds.origin.y);
-            ymax = ymax.max(bounds.origin.y + bounds.size.height);
-        }
-        if xmax <= xmin || ymax <= ymin {
-            return None;
-        }
-        Some(((xmax - xmin) as u32, (ymax - ymin) as u32))
+        active_display_rect().map(|(_, _, width, height)| (width as u32, height as u32))
     }
 
     async fn warp_cursor(&mut self, x: i32, y: i32) -> Result<(), EmulationError> {
@@ -1409,7 +1396,9 @@ impl Emulation for MacOSEmulation {
         // single-display / main-at-origin layout, the fix for a left/top
         // secondary. Mirrors the input-capture origin handling and the
         // Windows backend.
-        let (ox, oy) = display_union_origin();
+        let (ox, oy) = active_display_rect()
+            .map(|(origin_x, origin_y, _, _)| (origin_x, origin_y))
+            .unwrap_or((0., 0.));
         let pt = CGPoint {
             x: x as CGFloat + ox,
             y: y as CGFloat + oy,

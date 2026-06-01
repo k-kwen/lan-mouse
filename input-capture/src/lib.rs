@@ -358,6 +358,20 @@ impl InputCapture {
         self.peer_bounds.remove(&pos);
     }
 
+    /// Host display union as `(origin_x, origin_y, width, height)`,
+    /// all in the backend's pointer-event coordinate space. Keeping
+    /// origin and extent in one snapshot avoids mixing geometry from
+    /// different display configurations while monitors are being
+    /// rearranged.
+    fn display_rect(&self) -> Option<(i32, i32, u32, u32)> {
+        if let Some(rect) = self.capture.display_rect() {
+            return Some(rect);
+        }
+        let (width, height) = self.capture.display_bounds()?;
+        let (origin_x, origin_y) = self.capture.display_origin();
+        Some((origin_x, origin_y, width, height))
+    }
+
     /// Host's own display geometry — width and height in pixels of
     /// the union of all displays. Returns `None` when the active
     /// backend can't query its own bounds (e.g. xdg-desktop-portal,
@@ -365,14 +379,8 @@ impl InputCapture {
     /// [`ProtoEvent::CursorPos`] fraction the guest scales against
     /// its own bounds on Enter.
     pub fn display_bounds(&self) -> Option<(u32, u32)> {
-        self.capture.display_bounds()
-    }
-
-    /// Top-left corner of the host's display union in pointer-event
-    /// coordinate space. See `Capture::display_origin` for why this
-    /// matters on multi-monitor macOS hosts.
-    fn display_origin(&self) -> (i32, i32) {
-        self.capture.display_origin()
+        self.display_rect()
+            .map(|(_, _, width, height)| (width, height))
     }
 
     /// Host's screen-space cursor position normalized to the host's
@@ -386,11 +394,10 @@ impl InputCapture {
     /// `Bounds` round-trip from the peer, which can't have happened
     /// yet on the very first Enter.
     pub fn host_normalized_cursor(&self, cursor: (i32, i32)) -> Option<(f32, f32)> {
-        let (host_w, host_h) = self.display_bounds()?;
+        let (origin_x, origin_y, host_w, host_h) = self.display_rect()?;
         if host_w == 0 || host_h == 0 {
             return None;
         }
-        let (origin_x, origin_y) = self.display_origin();
         let (cx, cy) = cursor;
         // Subtract the union origin before normalizing so that
         // points on a non-origin display (e.g. a macOS external
@@ -416,9 +423,8 @@ impl InputCapture {
     /// the top regardless of resolution mismatch), the on-axis is
     /// pinned to the peer's far edge for the entering side.
     pub fn peer_warp_target(&self, pos: Position, cursor: (i32, i32)) -> Option<(i32, i32)> {
-        let (host_w, host_h) = self.display_bounds()?;
+        let (origin_x, origin_y, host_w, host_h) = self.display_rect()?;
         let &(peer_w, peer_h) = self.peer_bounds.get(&pos)?;
-        let (origin_x, origin_y) = self.display_origin();
         let (cx, cy) = cursor;
         // Subtract the union origin before normalizing — same
         // rationale as in host_normalized_cursor.
@@ -501,11 +507,10 @@ impl InputCapture {
     fn host_warp_target_on_release(&self, pos: Position) -> Option<(i32, i32)> {
         let (gx, gy) = self.virtual_cursor?;
         let &(peer_w, peer_h) = self.peer_bounds.get(&pos)?;
-        let (host_w, host_h) = self.capture.display_bounds()?;
+        let (origin_x, origin_y, host_w, host_h) = self.display_rect()?;
         if peer_w == 0 || peer_h == 0 || host_w == 0 || host_h == 0 {
             return None;
         }
-        let (origin_x, origin_y) = self.display_origin();
         let nx = (gx / peer_w as f64).clamp(0.0, 1.0);
         let ny = (gy / peer_h as f64).clamp(0.0, 1.0);
         let host_w_i = host_w as i32;
@@ -831,11 +836,20 @@ trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + U
     /// destroy the input capture
     async fn terminate(&mut self) -> Result<(), CaptureError>;
 
-    /// Host's own display geometry. Default implementation returns
-    /// `None`; backends that can query their own dimensions override
-    /// (currently macOS via CGDisplay; others may add this later).
-    fn display_bounds(&self) -> Option<(u32, u32)> {
+    /// Host display union as `(origin_x, origin_y, width, height)`,
+    /// all in the backend's pointer-event coordinate space. Backends
+    /// that can query display geometry should prefer overriding this
+    /// single snapshot method.
+    fn display_rect(&self) -> Option<(i32, i32, u32, u32)> {
         None
+    }
+
+    /// Host's own display geometry. Default implementation derives
+    /// from `display_rect`; backends with older width/height-only
+    /// support may still override this directly.
+    fn display_bounds(&self) -> Option<(u32, u32)> {
+        self.display_rect()
+            .map(|(_, _, width, height)| (width, height))
     }
 
     /// Top-left corner of the union of all displays in the host's
@@ -850,7 +864,9 @@ trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + U
     /// `clamp(0.0, 1.0)` in those helpers silently maps every point
     /// on a non-origin display to the screen edge.
     fn display_origin(&self) -> (i32, i32) {
-        (0, 0)
+        self.display_rect()
+            .map(|(origin_x, origin_y, _, _)| (origin_x, origin_y))
+            .unwrap_or((0, 0))
     }
 }
 

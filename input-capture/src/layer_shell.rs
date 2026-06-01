@@ -112,6 +112,26 @@ struct OutputInfo {
     size: (i32, i32),
 }
 
+fn output_union_rect(outputs: &[Output]) -> Option<(i32, i32, u32, u32)> {
+    let mut xmin = i32::MAX;
+    let mut ymin = i32::MAX;
+    let mut xmax = i32::MIN;
+    let mut ymax = i32::MIN;
+    for info in outputs.iter().filter_map(|o| o.info.as_ref()) {
+        if info.size.0 <= 0 || info.size.1 <= 0 {
+            continue;
+        }
+        xmin = xmin.min(info.position.0);
+        ymin = ymin.min(info.position.1);
+        xmax = xmax.max(info.position.0 + info.size.0);
+        ymax = ymax.max(info.position.1 + info.size.1);
+    }
+    if xmax <= xmin || ymax <= ymin {
+        return None;
+    }
+    Some((xmin, ymin, (xmax - xmin) as u32, (ymax - ymin) as u32))
+}
+
 struct State {
     active_positions: HashSet<Position>,
     pointer: Option<WlPointer>,
@@ -666,26 +686,12 @@ impl Capture for LayerShellInputCapture {
         Ok(())
     }
 
-    fn display_bounds(&self) -> Option<(u32, u32)> {
+    fn display_rect(&self) -> Option<(i32, i32, u32, u32)> {
         // Union of every active output's rectangle in compositor
         // coords. Mirrors the macOS impl so MotionAbsolute scaling
         // stays consistent: cursor coords reported in this same
         // space normalize cleanly against the returned dimensions.
-        let outputs = &self.0.get_ref().state.outputs;
-        let mut xmin = i32::MAX;
-        let mut ymin = i32::MAX;
-        let mut xmax = i32::MIN;
-        let mut ymax = i32::MIN;
-        for info in outputs.iter().filter_map(|o| o.info.as_ref()) {
-            xmin = xmin.min(info.position.0);
-            ymin = ymin.min(info.position.1);
-            xmax = xmax.max(info.position.0 + info.size.0);
-            ymax = ymax.max(info.position.1 + info.size.1);
-        }
-        if xmax <= xmin || ymax <= ymin {
-            return None;
-        }
-        Some(((xmax - xmin) as u32, (ymax - ymin) as u32))
+        output_union_rect(&self.0.get_ref().state.outputs)
     }
 }
 

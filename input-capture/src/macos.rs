@@ -46,6 +46,39 @@ struct Bounds {
     ymax: f64,
 }
 
+impl Bounds {
+    fn from_active_displays() -> Result<Option<Self>, MacosCaptureCreationError> {
+        let active_ids =
+            CGDisplay::active_displays().map_err(MacosCaptureCreationError::ActiveDisplays)?;
+        let mut bounds = Self {
+            xmin: f64::INFINITY,
+            xmax: f64::NEG_INFINITY,
+            ymin: f64::INFINITY,
+            ymax: f64::NEG_INFINITY,
+        };
+        for display in active_ids {
+            let rect = CGDisplay::new(display).bounds();
+            bounds.xmin = bounds.xmin.min(rect.origin.x);
+            bounds.xmax = bounds.xmax.max(rect.origin.x + rect.size.width);
+            bounds.ymin = bounds.ymin.min(rect.origin.y);
+            bounds.ymax = bounds.ymax.max(rect.origin.y + rect.size.height);
+        }
+        if bounds.xmax <= bounds.xmin || bounds.ymax <= bounds.ymin {
+            return Ok(None);
+        }
+        Ok(Some(bounds))
+    }
+
+    fn display_rect(self) -> (i32, i32, u32, u32) {
+        (
+            self.xmin as i32,
+            self.ymin as i32,
+            (self.xmax - self.xmin) as u32,
+            (self.ymax - self.ymin) as u32,
+        )
+    }
+}
+
 #[derive(Debug)]
 struct InputCaptureState {
     /// active capture positions
@@ -119,15 +152,11 @@ impl InputCaptureState {
 
     // Get the max bounds of all displays
     fn update_bounds(&mut self) -> Result<(), MacosCaptureCreationError> {
-        let active_ids =
-            CGDisplay::active_displays().map_err(MacosCaptureCreationError::ActiveDisplays)?;
-        active_ids.iter().for_each(|d| {
-            let bounds = CGDisplay::new(*d).bounds();
-            self.bounds.xmin = self.bounds.xmin.min(bounds.origin.x);
-            self.bounds.xmax = self.bounds.xmax.max(bounds.origin.x + bounds.size.width);
-            self.bounds.ymin = self.bounds.ymin.min(bounds.origin.y);
-            self.bounds.ymax = self.bounds.ymax.max(bounds.origin.y + bounds.size.height);
-        });
+        if let Some(bounds) = Bounds::from_active_displays()? {
+            self.bounds = bounds;
+        } else {
+            log::warn!("failed to compute active display bounds");
+        }
 
         log::debug!("Updated displays bounds: {0:?}", self.bounds);
         Ok(())
@@ -870,52 +899,11 @@ impl Capture for MacOSInputCapture {
         Ok(())
     }
 
-    fn display_bounds(&self) -> Option<(u32, u32)> {
-        // Mirror the InputEmulation-side implementation: the union of
-        // every active display's rectangle, in points (which match
-        // the units used by CGEvent.location() so the
-        // MotionAbsolute math stays internally consistent).
-        let displays = CGDisplay::active_displays().ok()?;
-        let mut xmin = f64::INFINITY;
-        let mut xmax = f64::NEG_INFINITY;
-        let mut ymin = f64::INFINITY;
-        let mut ymax = f64::NEG_INFINITY;
-        for id in displays {
-            let bounds = CGDisplay::new(id).bounds();
-            xmin = xmin.min(bounds.origin.x);
-            xmax = xmax.max(bounds.origin.x + bounds.size.width);
-            ymin = ymin.min(bounds.origin.y);
-            ymax = ymax.max(bounds.origin.y + bounds.size.height);
-        }
-        if xmax <= xmin || ymax <= ymin {
-            return None;
-        }
-        Some(((xmax - xmin) as u32, (ymax - ymin) as u32))
-    }
-
-    fn display_origin(&self) -> (i32, i32) {
-        // Top-left of the union of all active displays. Matters when
-        // a secondary monitor is positioned LEFT of (or ABOVE) the
-        // primary — the global pointer-coordinate system is anchored
-        // at the primary's top-left, so a left-attached external
-        // gives cursor x ∈ [-w, 0). Without this offset,
-        // host_normalized_cursor / peer_warp_target's clamp(0, 1)
-        // silently maps every point on the external to "left edge"
-        // and the receiver warps to the wrong column.
-        let Ok(displays) = CGDisplay::active_displays() else {
-            return (0, 0);
-        };
-        let mut xmin = f64::INFINITY;
-        let mut ymin = f64::INFINITY;
-        for id in displays {
-            let bounds = CGDisplay::new(id).bounds();
-            xmin = xmin.min(bounds.origin.x);
-            ymin = ymin.min(bounds.origin.y);
-        }
-        if xmin.is_infinite() || ymin.is_infinite() {
-            return (0, 0);
-        }
-        (xmin as i32, ymin as i32)
+    fn display_rect(&self) -> Option<(i32, i32, u32, u32)> {
+        Bounds::from_active_displays()
+            .ok()
+            .flatten()
+            .map(Bounds::display_rect)
     }
 }
 
