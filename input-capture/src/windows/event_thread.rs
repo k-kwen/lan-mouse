@@ -344,10 +344,16 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
 
     /* update active client and entry point */
     ACTIVE_CLIENT.replace(Some(pos));
-    let entry_point = DISPLAYS.with_borrow(|(displays, _)| {
+
+    // The activation event is passed through below, so Windows freezes the
+    // cursor at curr_pos once subsequent captured events are swallowed.
+    // ENTRY_POINT is the motion-delta baseline and must match that real
+    // frozen position, not the clamped landing coordinate.
+    ENTRY_POINT.replace(curr_pos);
+
+    let landing_point = DISPLAYS.with_borrow(|(displays, _)| {
         display_util::clamp_to_display_bounds(displays, prev_pos, curr_pos)
     });
-    ENTRY_POINT.replace(entry_point);
 
     /* notify main thread */
     log::debug!("ENTERED @ {prev_pos:?} -> {curr_pos:?}");
@@ -355,7 +361,7 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
     blocking_send_event(
         active,
         CaptureEvent::Begin {
-            cursor: Some(entry_point),
+            cursor: Some(landing_point),
         },
     );
 
@@ -712,13 +718,11 @@ fn to_mouse_event(wparam: WPARAM, lparam: LPARAM) -> Option<PointerEvent> {
             let (x, y) = (mouse_low_level.pt.x, mouse_low_level.pt.y);
             let (ex, ey) = ENTRY_POINT.get();
             // Events are swallowed (mouse_proc returns LRESULT(1)) while
-            // captured, so the OS cursor stays frozen at the entry point and
-            // each WM_MOUSEMOVE reports pt = entry + this event's raw delta.
-            // The per-event delta is therefore pt - ENTRY_POINT with
-            // ENTRY_POINT held FIXED. Do NOT advance ENTRY_POINT per event:
-            // that emits delta-of-deltas and breaks motion. The real
-            // negative-coordinate bug lives in the Enter-warp path
-            // (Windows display_bounds/origin), not here.
+            // captured, so the OS cursor stays frozen at the activation
+            // point and each WM_MOUSEMOVE reports pt = entry + this event's
+            // raw delta. ENTRY_POINT is set once to that actual frozen point.
+            // Do NOT advance ENTRY_POINT per event: that emits
+            // delta-of-deltas and breaks motion.
             let (dx, dy) = (x - ex, y - ey);
             let (dx, dy) = (dx as f64, dy as f64);
             Some(PointerEvent::Motion { time: 0, dx, dy })
