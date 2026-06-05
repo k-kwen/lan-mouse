@@ -166,6 +166,16 @@ impl ListenTask {
                                 last_enter_at.insert(addr, now);
                                 if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
                                     log::info!("releasing capture: {addr} entered this device");
+                                    // Self-heal state stranded from a prior crossing: a
+                                    // button-up or Leave lost over unreliable UDP can leave
+                                    // a button/key held on this guest, turning every later
+                                    // motion into a drag (macOS emits *MouseDragged while a
+                                    // button is held). Release once per authenticated, non-
+                                    // duplicate Enter — before this crossing's first Input —
+                                    // so a fresh crossing never begins mid-drag. This
+                                    // crossing's real button-downs arrive afterward as Input,
+                                    // so a legitimate in-crossing drag is unaffected.
+                                    self.emulation_proxy.release_state(addr);
                                     self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
                                     self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                                     // Send the receiving device's display
@@ -328,6 +338,10 @@ enum ProxyRequest {
     /// `Enter` to seat the cursor at the entry edge so the
     /// capturing peer's wall-press model is synchronized.
     Warp(i32, i32),
+    /// Release every button/key still held for this peer's handle.
+    /// Sent on `Enter` to self-heal state stranded from a prior
+    /// crossing whose button-up or `Leave` was lost over UDP.
+    ReleaseState(SocketAddr),
 }
 
 impl EmulationProxy {
@@ -371,6 +385,19 @@ impl EmulationProxy {
             return;
         }
         let _ = self.request_tx.send(ProxyRequest::Warp(x, y));
+    }
+
+    /// Fire-and-forget release of any buttons/keys still held for
+    /// `addr`'s handle. Sent on `Enter` so a fresh crossing can
+    /// never begin with state stranded from a prior crossing whose
+    /// button-up or `Leave` was lost over unreliable UDP — otherwise
+    /// macOS turns every subsequent motion into a `*MouseDragged`.
+    /// Drops silently when emulation isn't active (no live backend).
+    pub(crate) fn release_state(&self, addr: SocketAddr) {
+        if !self.emulation_active.get() {
+            return;
+        }
+        let _ = self.request_tx.send(ProxyRequest::ReleaseState(addr));
     }
 
     async fn event(&mut self) -> EmulationEvent {
@@ -443,6 +470,7 @@ impl EmulationTask {
                     ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
                     ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
                     ProxyRequest::Warp(..) => { /* emulation inactive => ignore */ }
+                    ProxyRequest::ReleaseState(..) => { /* emulation inactive => ignore */ }
                 }
             }
         }
@@ -523,6 +551,18 @@ impl EmulationTask {
                             log::warn!("warp_cursor failed: {e}");
                         }
                     }
+                    ProxyRequest::ReleaseState(addr) => {
+                        // Only release for a handle that already exists; if
+                        // this peer has never sent input there is nothing
+                        // held. Releasing buttons clears any stale drag and
+                        // release_keys clears stuck modifiers — both without
+                        // destroying the handle, so the per-addr mapping and
+                        // warp model stay intact across the crossing.
+                        if let Some(&handle) = self.handles.get(&addr) {
+                            let _ = emulation.release_buttons(handle).await;
+                            let _ = emulation.release_keys(handle).await;
+                        }
+                    }
                     ProxyRequest::Terminate => break Ok(()),
                     ProxyRequest::Reenable => continue,
                 },
@@ -554,6 +594,7 @@ async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
             ProxyRequest::Input(_, _) => continue,
             ProxyRequest::Remove(_) => continue,
             ProxyRequest::Warp(_, _) => continue,
+            ProxyRequest::ReleaseState(_) => continue,
             ProxyRequest::Reenable => continue,
         }
     }
