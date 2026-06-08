@@ -9,7 +9,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::error::TrySendError;
-use windows::Win32::Foundation::{FALSE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{FALSE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     DEVMODEW, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISPLAY_DEVICEW, ENUM_CURRENT_SETTINGS,
     EnumDisplayDevicesW, EnumDisplaySettingsW,
@@ -26,8 +26,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     KEYEVENTF_SCANCODE, SendInput,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DispatchMessageW, EDD_GET_DEVICE_INTERFACE_NAME, GetCursorPos,
-    GetMessageW,
+    CallNextHookEx, CreateWindowExW, DispatchMessageW, EDD_GET_DEVICE_INTERFACE_NAME, GetMessageW,
     HOOKPROC, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, PostThreadMessageW,
     RegisterClassW, SetWindowsHookExW, TranslateMessage, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_STYLE,
     WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
@@ -128,9 +127,6 @@ thread_local! {
     static EVENT_TX: RefCell<Option<Sender<(Position, CaptureEvent)>>> = const { RefCell::new(None) };
     /// position of barrier entry
     static ENTRY_POINT: Cell<(i32, i32)> = const { Cell::new((0, 0)) };
-    /// True after a barrier crossing until the first captured motion pins
-    /// ENTRY_POINT to the real (OS-clamped) frozen cursor position.
-    static ENTRY_PENDING: Cell<bool> = const { Cell::new(false) };
     /// previous mouse position
     static PREV_POS: Cell<Option<(i32, i32)>> = const { Cell::new(None) };
     /// displays and generation counter
@@ -349,17 +345,11 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
     /* update active client and entry point */
     ACTIVE_CLIENT.replace(Some(pos));
 
-    // The activation event is passed through below; Windows then freezes
-    // the cursor at the position it lands on after the OS clamps that
-    // event to the virtual-desktop bounds. On fast / diagonal / multi-
-    // monitor crossings that clamped landing differs from the un-clamped
-    // `curr_pos` we crossed at, so using curr_pos as the motion-delta
-    // baseline injects a constant directional offset into every move —
-    // the residual drift. Seed a fallback now and defer the authoritative
-    // baseline to the first captured motion, which reads the real frozen
-    // cursor position via GetCursorPos (see to_mouse_event).
+    // The activation event is passed through below, so Windows freezes the
+    // cursor at curr_pos once subsequent captured events are swallowed.
+    // ENTRY_POINT is the motion-delta baseline and must match that real
+    // frozen position, not the clamped landing coordinate.
     ENTRY_POINT.replace(curr_pos);
-    ENTRY_PENDING.set(true);
 
     let landing_point = DISPLAYS.with_borrow(|(displays, _)| {
         display_util::clamp_to_display_bounds(displays, prev_pos, curr_pos)
@@ -726,36 +716,11 @@ fn to_mouse_event(wparam: WPARAM, lparam: LPARAM) -> Option<PointerEvent> {
         }),
         WPARAM(p) if p == WM_MOUSEMOVE as usize => {
             let (x, y) = (mouse_low_level.pt.x, mouse_low_level.pt.y);
-            // First captured motion after a crossing: pin the delta baseline
-            // to the ACTUAL frozen cursor position. The cursor has not moved
-            // since activation (every event since was swallowed), so the OS
-            // cursor still sits at the clamped landing point — which can
-            // differ from the un-clamped `curr_pos` seeded at activation on
-            // fast / diagonal / multi-monitor crossings. Reading it here
-            // removes the constant offset behind the residual directional
-            // drift.
-            if ENTRY_PENDING.get() {
-                let seeded = ENTRY_POINT.get();
-                let mut pt = POINT::default();
-                let frozen = unsafe {
-                    if GetCursorPos(&mut pt).is_ok() {
-                        (pt.x, pt.y)
-                    } else {
-                        seeded
-                    }
-                };
-                ENTRY_POINT.set(frozen);
-                ENTRY_PENDING.set(false);
-                log::debug!(
-                    "entry baseline pinned to frozen cursor {frozen:?} \
-                     (activation curr_pos was {seeded:?}); first move pt=({x},{y})"
-                );
-            }
             let (ex, ey) = ENTRY_POINT.get();
             // Events are swallowed (mouse_proc returns LRESULT(1)) while
-            // captured, so the OS cursor stays frozen and each WM_MOUSEMOVE
-            // reports pt = frozen + this event's raw delta. ENTRY_POINT is the
-            // frozen point, so pt - ENTRY_POINT is the pure per-event delta.
+            // captured, so the OS cursor stays frozen at the activation
+            // point and each WM_MOUSEMOVE reports pt = entry + this event's
+            // raw delta. ENTRY_POINT is set once to that actual frozen point.
             // Do NOT advance ENTRY_POINT per event: that emits
             // delta-of-deltas and breaks motion.
             let (dx, dy) = (x - ex, y - ey);
