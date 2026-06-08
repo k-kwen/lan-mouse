@@ -106,19 +106,22 @@ impl LanMouseListener {
             let connection_attempts = connection_attempts.clone();
             Some(Arc::new(
                 move |certs: &[Vec<u8>], _chains: &[CertificateDer<'static>]| {
-                    assert!(certs.len() == 1);
-                    let fingerprints = certs
-                        .iter()
-                        .map(|c| crypto::generate_fingerprint(c))
-                        .collect::<Vec<_>>();
-                    if authorized
-                        .read()
-                        .expect("lock")
-                        .contains_key(&fingerprints[0])
-                    {
+                    // Runs during the DTLS handshake for ANY connecting peer,
+                    // before authorization. A legitimate peer presents exactly
+                    // one self-signed leaf certificate; reject anything else
+                    // gracefully instead of panicking — with `panic = "abort"`
+                    // a panic here would be an unauthenticated remote DoS.
+                    let [cert] = certs else {
+                        log::warn!(
+                            "rejecting peer: expected exactly one certificate, got {}",
+                            certs.len()
+                        );
+                        return Err(webrtc_dtls::Error::ErrVerifyDataMismatch);
+                    };
+                    let fingerprint = crypto::generate_fingerprint(cert);
+                    if authorized.read().expect("lock").contains_key(&fingerprint) {
                         Ok(())
                     } else {
-                        let fingerprint = fingerprints.into_iter().next().expect("fingerprint");
                         connection_attempts
                             .lock()
                             .expect("lock")

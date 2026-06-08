@@ -529,6 +529,20 @@ async fn connect_to_handle(
         let expected_fingerprint = client_manager
             .get_peer_fingerprint(handle)
             .map(|fp| normalize_fingerprint(&fp));
+        // Refuse to dial without a pinned peer fingerprint. The dialer sets
+        // `insecure_skip_verify`, so an unpinned outbound DTLS session performs
+        // NO server authentication and would stream locally-captured input to
+        // whatever host answers at the (possibly spoofed) address — a MITM
+        // keystroke-exfiltration risk. Mirror the listener's default-deny
+        // posture; the `pair` flow always records a fingerprint.
+        if expected_fingerprint.is_none() {
+            log::warn!(
+                "client {handle} has no peer_fingerprint; refusing to connect \
+                 (run `lan-mouse pair` or set peer_fingerprint to enable authenticated outbound)"
+            );
+            record_attempt_failure(&attempt_states, handle, &ips_set, primary_ip);
+            return Err(LanMouseConnectionError::NotConnected);
+        }
         log::info!("client ({handle}) connecting ... (ips: {addrs:?}, preferred: {preferred:?})");
         if addrs.is_empty() && preferred.is_none() {
             // Nothing to dial. Bump backoff and bail without spawning
