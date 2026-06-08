@@ -606,11 +606,28 @@ fn create_event_tap<'a>(
         }
 
         if let Some(pos) = capture_position {
-            res_events.iter().for_each(|e| {
-                // error must be ignored, since the event channel
-                // may already be closed when the InputCapture instance is dropped.
-                let _ = event_tx.blocking_send((pos, *e));
-            });
+            // CGEventTap callbacks must never block. If this queue is full,
+            // WindowServer can disable the tap with TapDisabledByTimeout.
+            // Stateless motion may be dropped; Begin/key/button/release events
+            // should log loudly because dropping them changes capture state.
+            for event in res_events.iter().copied() {
+                match event_tx.try_send((pos, event)) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full((
+                        _,
+                        CaptureEvent::Input(Event::Pointer(PointerEvent::Motion { .. })),
+                    ))) => {
+                        log::debug!("dropping macOS pointer motion: capture queue full");
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Full((_, event))) => {
+                        log::warn!("dropping macOS capture event because queue is full: {event:?}");
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        log::debug!("dropping macOS capture event: capture queue closed");
+                        break;
+                    }
+                }
+            }
             // Returning Drop should stop the event from being processed
             // but core fundation still returns the event
             cg_ev.set_type(CGEventType::Null);

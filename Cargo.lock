@@ -1879,6 +1879,7 @@ dependencies = [
 name = "lan-mouse"
 version = "0.10.0"
 dependencies = [
+ "async-trait",
  "clap",
  "env_logger",
  "futures",

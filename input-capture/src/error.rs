@@ -71,8 +71,8 @@ pub enum CaptureCreationError {
     #[error("error creating x11 capture backend: `{0}`")]
     X11(#[from] X11InputCaptureCreationError),
     #[cfg(windows)]
-    #[error("error creating windows capture backend")]
-    Windows,
+    #[error("error creating windows capture backend: `{0}`")]
+    Windows(#[from] WindowsCaptureCreationError),
     #[cfg(target_os = "macos")]
     #[error("error creating macos capture backend: `{0}`")]
     MacOS(#[from] MacosCaptureCreationError),
@@ -139,6 +139,13 @@ pub enum LayerShellCaptureCreationError {
 pub enum X11InputCaptureCreationError {
     #[error("X11 input capture is not yet implemented :(")]
     NotImplemented,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Error)]
+pub enum WindowsCaptureCreationError {
+    #[error("failed to start event thread: `{0}`")]
+    EventThread(String),
 }
 
 #[cfg(target_os = "macos")]

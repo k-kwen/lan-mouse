@@ -225,7 +225,10 @@ impl Service {
                 event = self.emulation.event() => self.handle_emulation_event(event).await,
                 event = self.capture.event() => self.handle_capture_event(event),
                 event = self.resolver.event() => self.handle_resolver_event(event),
-                _ = self.config.changed() => self.handle_config_change(),
+                result = self.config.changed() => match result {
+                    Ok(()) => self.handle_config_change(),
+                    Err(e) => log::warn!("config watcher error: {e}"),
+                },
                 _ = discovery_refresh_tick.tick() => self.discovery.refresh().await,
                 _ = health_tick.tick() => {
                     if let Err(e) = self.health_check() {

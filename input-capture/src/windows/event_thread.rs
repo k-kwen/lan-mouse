@@ -40,6 +40,8 @@ use input_event::{
     scancode::{self, Linux},
 };
 
+use crate::error::WindowsCaptureCreationError;
+
 use super::{CaptureEvent, Position, display_util};
 
 pub(crate) struct EventThread {
@@ -49,14 +51,16 @@ pub(crate) struct EventThread {
 }
 
 impl EventThread {
-    pub(crate) fn new(event_tx: Sender<(Position, CaptureEvent)>) -> Self {
+    pub(crate) fn new(
+        event_tx: Sender<(Position, CaptureEvent)>,
+    ) -> Result<Self, WindowsCaptureCreationError> {
         let request_buffer = Default::default();
-        let (thread, thread_id) = start(event_tx, Arc::clone(&request_buffer));
-        Self {
+        let (thread, thread_id) = start(event_tx, Arc::clone(&request_buffer))?;
+        Ok(Self {
             request_buffer,
             thread: Some(thread),
             thread_id,
-        }
+        })
     }
 
     pub(crate) fn release_capture(&self) {
@@ -105,10 +109,6 @@ enum RequestType {
 enum ClientUpdate {
     Create(Position),
     Destroy(Position),
-}
-
-fn blocking_send_event(pos: Position, event: CaptureEvent) {
-    EVENT_TX.with_borrow_mut(|tx| tx.as_mut().unwrap().blocking_send((pos, event)).unwrap())
 }
 
 fn try_send_event(
@@ -164,47 +164,70 @@ fn get_msg() -> Option<MSG> {
 fn start(
     event_tx: Sender<(Position, CaptureEvent)>,
     request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
-) -> (thread::JoinHandle<()>, u32) {
-    /* condition variable to wait for thead id */
-    let thread_id = Arc::new((Condvar::new(), Mutex::new(None)));
-    let thread_id_ = Arc::clone(&thread_id);
+) -> Result<(thread::JoinHandle<()>, u32), WindowsCaptureCreationError> {
+    let ready = Arc::new((Condvar::new(), Mutex::new(None::<Result<u32, String>>)));
+    let ready_for_thread = Arc::clone(&ready);
 
-    let msg_thread = thread::spawn(|| start_routine(thread_id_, event_tx, request_buffer));
+    let msg_thread =
+        thread::spawn(move || start_routine(ready_for_thread, event_tx, request_buffer));
 
-    /* wait for thread to set its id */
-    let (cond, thread_id) = &*thread_id;
-    let mut thread_id = thread_id.lock().unwrap();
-    while (*thread_id).is_none() {
-        thread_id = cond.wait(thread_id).expect("channel closed");
+    let (cond, state) = &*ready;
+    let mut state = state.lock().unwrap();
+    while state.is_none() {
+        state = cond.wait(state).expect("event thread ready channel closed");
     }
-    (msg_thread, thread_id.expect("thread id"))
+    let result = state.take().expect("event thread ready");
+    drop(state);
+    match result {
+        Ok(thread_id) => Ok((msg_thread, thread_id)),
+        Err(e) => {
+            let _ = msg_thread.join();
+            Err(WindowsCaptureCreationError::EventThread(e))
+        }
+    }
+}
+
+fn notify_ready(
+    ready: &Arc<(Condvar, Mutex<Option<Result<u32, String>>>)>,
+    result: Result<u32, String>,
+) {
+    let (cnd, mtx) = &**ready;
+    let mut state = mtx.lock().unwrap();
+    *state = Some(result);
+    cnd.notify_one();
 }
 
 fn start_routine(
-    ready: Arc<(Condvar, Mutex<Option<u32>>)>,
+    ready: Arc<(Condvar, Mutex<Option<Result<u32, String>>>)>,
     event_tx: Sender<(Position, CaptureEvent)>,
     request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
 ) {
     EVENT_TX.replace(Some(event_tx));
-    /* communicate thread id */
-    {
-        let (cnd, mtx) = &*ready;
-        let mut ready = mtx.lock().unwrap();
-        *ready = Some(unsafe { GetCurrentThreadId() });
-        cnd.notify_one();
-    }
 
     let mouse_proc: HOOKPROC = Some(mouse_proc);
     let kybrd_proc: HOOKPROC = Some(kybrd_proc);
     let window_proc: WNDPROC = Some(window_proc);
 
     /* register hooks */
-    unsafe {
-        let _ = SetWindowsHookExW(WH_MOUSE_LL, mouse_proc, None, 0).unwrap();
-        let _ = SetWindowsHookExW(WH_KEYBOARD_LL, kybrd_proc, None, 0).unwrap();
+    if let Err(e) = unsafe { SetWindowsHookExW(WH_MOUSE_LL, mouse_proc, None, 0) } {
+        notify_ready(&ready, Err(format!("SetWindowsHookExW(WH_MOUSE_LL): {e}")));
+        return;
+    }
+    if let Err(e) = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, kybrd_proc, None, 0) } {
+        notify_ready(
+            &ready,
+            Err(format!("SetWindowsHookExW(WH_KEYBOARD_LL): {e}")),
+        );
+        return;
     }
 
-    let instance = unsafe { GetModuleHandleW(None).unwrap() };
+    let instance = match unsafe { GetModuleHandleW(None) } {
+        Ok(instance) => instance,
+        Err(e) => {
+            notify_ready(&ready, Err(format!("GetModuleHandleW: {e}")));
+            return;
+        }
+    };
     let instance = instance.into();
     let window_class: WNDCLASSW = WNDCLASSW {
         lpfnWndProc: window_proc,
@@ -222,7 +245,9 @@ fn start_routine(
         unsafe {
             let ret = RegisterClassW(&window_class);
             if ret == 0 {
-                panic!("RegisterClassW");
+                WINDOW_CLASS_REGISTERED.store(false, Ordering::SeqCst);
+                notify_ready(&ready, Err("RegisterClassW failed".to_owned()));
+                return;
             }
         }
     }
@@ -230,7 +255,7 @@ fn start_routine(
     /* window is used to receive WM_DISPLAYCHANGE and
      * WM_WTSSESSION_CHANGE messages. Keep the HWND so we can register
      * for session notifications and unregister on exit. */
-    let msg_window = unsafe {
+    let msg_window = match unsafe {
         CreateWindowExW(
             Default::default(),
             w!("lan-mouse-message-window-class"),
@@ -245,8 +270,15 @@ fn start_routine(
             Some(instance),
             None,
         )
-        .expect("CreateWindowExW")
+    } {
+        Ok(window) => window,
+        Err(e) => {
+            notify_ready(&ready, Err(format!("CreateWindowExW: {e}")));
+            return;
+        }
     };
+
+    notify_ready(&ready, Ok(unsafe { GetCurrentThreadId() }));
 
     /* register for WM_WTSSESSION_CHANGE notifications so we can
      * detect lock/unlock and suppress crossings while locked. Failure
@@ -358,12 +390,16 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
     /* notify main thread */
     log::debug!("ENTERED @ {prev_pos:?} -> {curr_pos:?}");
     let active = ACTIVE_CLIENT.get().expect("active client");
-    blocking_send_event(
-        active,
-        CaptureEvent::Begin {
-            cursor: Some(landing_point),
-        },
-    );
+    let begin = CaptureEvent::Begin {
+        cursor: Some(landing_point),
+    };
+    if let Err(e) = try_send_event(active, begin) {
+        match e {
+            TrySendError::Full(_) => log::warn!("dropping Begin event: capture queue full"),
+            TrySendError::Closed(_) => log::warn!("dropping Begin event: capture queue closed"),
+        }
+        ACTIVE_CLIENT.take();
+    }
 
     ret
 }

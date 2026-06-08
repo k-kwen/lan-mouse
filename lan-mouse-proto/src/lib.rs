@@ -24,6 +24,13 @@ pub enum ProtocolError {
     /// event type is a retired wire variant
     #[error("unsupported event: `{0}`")]
     UnsupportedEvent(&'static str),
+    /// event payload length does not match the wire format
+    #[error("truncated event `{event}`: expected {expected} bytes, got {actual}")]
+    Truncated {
+        event: &'static str,
+        expected: usize,
+        actual: usize,
+    },
 }
 
 /// Position of a client
@@ -139,6 +146,31 @@ pub enum EventType {
 
 const RETIRED_MOTION_ABSOLUTE_EVENT_ID: u8 = 12;
 
+fn event_wire_len(event_type: u8) -> Result<(&'static str, usize), ProtocolError> {
+    if event_type == RETIRED_MOTION_ABSOLUTE_EVENT_ID {
+        return Err(ProtocolError::UnsupportedEvent("MotionAbsolute"));
+    }
+
+    let event_type = EventType::try_from(event_type)?;
+    let spec = match event_type {
+        EventType::PointerMotion => ("PointerMotion", 1 + 4 + 8 + 8),
+        EventType::PointerButton => ("PointerButton", 1 + 4 + 4 + 4),
+        EventType::PointerAxis => ("PointerAxis", 1 + 4 + 1 + 8),
+        EventType::PointerAxisValue120 => ("PointerAxisValue120", 1 + 1 + 4),
+        EventType::KeyboardKey => ("KeyboardKey", 1 + 4 + 4 + 1),
+        EventType::KeyboardModifiers => ("KeyboardModifiers", 1 + 4 + 4 + 4 + 4),
+        EventType::Ping => ("Ping", 1),
+        EventType::Pong => ("Pong", 1 + 1),
+        EventType::Enter => ("Enter", 1 + 1),
+        EventType::Leave => ("Leave", 1 + 4),
+        EventType::Ack => ("Ack", 1 + 4),
+        EventType::Bounds => ("Bounds", 1 + 4 + 4),
+        EventType::CursorPos => ("CursorPos", 1 + 1 + 4 + 4),
+        EventType::Hello => ("Hello", 1 + 8),
+    };
+    Ok(spec)
+}
+
 impl ProtoEvent {
     fn event_type(&self) -> EventType {
         match self {
@@ -166,15 +198,28 @@ impl ProtoEvent {
     }
 }
 
-impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
+impl TryFrom<&[u8]> for ProtoEvent {
     type Error = ProtocolError;
 
-    fn try_from(buf: [u8; MAX_EVENT_SIZE]) -> Result<Self, Self::Error> {
-        let mut buf = &buf[..];
-        let event_type = decode_u8(&mut buf)?;
-        if event_type == RETIRED_MOTION_ABSOLUTE_EVENT_ID {
-            return Err(ProtocolError::UnsupportedEvent("MotionAbsolute"));
+    fn try_from(buf: &[u8]) -> Result<Self, Self::Error> {
+        let Some((&event_type, _)) = buf.split_first() else {
+            return Err(ProtocolError::Truncated {
+                event: "<event-type>",
+                expected: 1,
+                actual: 0,
+            });
+        };
+        let (name, expected) = event_wire_len(event_type)?;
+        if buf.len() != expected {
+            return Err(ProtocolError::Truncated {
+                event: name,
+                expected,
+                actual: buf.len(),
+            });
         }
+
+        let mut buf = buf;
+        let event_type = decode_u8(&mut buf)?;
         match EventType::try_from(event_type)? {
             EventType::PointerMotion => {
                 Ok(Self::Input(InputEvent::Pointer(PointerEvent::Motion {
@@ -236,6 +281,14 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
                 Ok(Self::Hello { commit })
             }
         }
+    }
+}
+
+impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
+    type Error = ProtocolError;
+
+    fn try_from(buf: [u8; MAX_EVENT_SIZE]) -> Result<Self, Self::Error> {
+        Self::try_from(&buf[..])
     }
 }
 
@@ -370,6 +423,64 @@ mod tests {
         assert!(matches!(
             ProtoEvent::try_from(buf),
             Err(ProtocolError::UnsupportedEvent("MotionAbsolute"))
+        ));
+    }
+
+    #[test]
+    fn truncated_pong_is_rejected() {
+        let buf = [EventType::Pong as u8];
+
+        assert!(matches!(
+            ProtoEvent::try_from(&buf[..]),
+            Err(ProtocolError::Truncated {
+                event: "Pong",
+                expected: 2,
+                actual: 1,
+            })
+        ));
+    }
+
+    #[test]
+    fn short_ping_is_accepted_but_padded_ping_is_rejected() {
+        let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = ProtoEvent::Ping.into();
+
+        assert!(matches!(
+            ProtoEvent::try_from(&buf[..len]),
+            Ok(ProtoEvent::Ping)
+        ));
+        assert!(matches!(
+            ProtoEvent::try_from(&buf[..]),
+            Err(ProtocolError::Truncated {
+                event: "Ping",
+                expected: 1,
+                actual: MAX_EVENT_SIZE,
+            })
+        ));
+    }
+
+    #[test]
+    fn cursor_pos_requires_exact_payload_length() {
+        let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = ProtoEvent::CursorPos {
+            pos: Position::Left,
+            nx: 0.5,
+            ny: 0.25,
+        }
+        .into();
+
+        assert!(matches!(
+            ProtoEvent::try_from(&buf[..len - 1]),
+            Err(ProtocolError::Truncated {
+                event: "CursorPos",
+                expected: 10,
+                actual,
+            }) if actual == len - 1
+        ));
+        assert!(matches!(
+            ProtoEvent::try_from(&buf[..len]),
+            Ok(ProtoEvent::CursorPos {
+                pos: Position::Left,
+                ..
+            })
         ));
     }
 }

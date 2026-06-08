@@ -76,6 +76,9 @@ mdns-sd = "0.19"
 netdev = "0.43"
 hostname = "0.4"
 
+[dev-dependencies]
+async-trait = "0.1.81"
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.148"
 

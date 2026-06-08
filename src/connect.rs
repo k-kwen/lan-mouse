@@ -402,18 +402,20 @@ impl LanMouseConnection {
                 return Err(LanMouseConnectionError::TargetEmulationDisabled);
             }
             match conn.send(buf).await {
-                Ok(_) => {}
+                Ok(_) => {
+                    log::trace!("{event} >->->->->- {addr}");
+                    Ok(())
+                }
                 Err(e) => {
                     log::warn!("client {handle} failed to send: {e}");
                     disconnect(&self.client_manager, handle, addr, &conn, &self.conns).await;
+                    Err(e.into())
                 }
             }
-            log::trace!("{event} >->->->->- {addr}");
-            return Ok(());
+        } else {
+            self.ensure_connected(handle).await;
+            Err(LanMouseConnectionError::NotConnected)
         }
-
-        self.ensure_connected(handle).await;
-        Err(LanMouseConnectionError::NotConnected)
     }
 
     async fn conn_for_handle(
@@ -654,7 +656,7 @@ async fn receive_loop(
     expected_fingerprint: Option<String>,
 ) {
     let mut buf = [0u8; MAX_EVENT_SIZE];
-    while conn.recv(&mut buf).await.is_ok() {
+    while let Ok(len) = conn.recv(&mut buf).await {
         let current_fingerprint = client_manager
             .get_peer_fingerprint(handle)
             .map(|fp| normalize_fingerprint(&fp));
@@ -666,7 +668,7 @@ async fn receive_loop(
             let _ = conn.close().await;
             break;
         }
-        match buf.try_into() {
+        match ProtoEvent::try_from(&buf[..len]) {
             Ok(event) => {
                 log::trace!("{addr} <==<==<== {event}");
                 match event {
@@ -728,6 +730,9 @@ async fn disconnect(
             "stale connection for client ({handle}) @ {addr} closed after a newer session was installed"
         );
     }
+    if let Err(e) = conn.close().await {
+        log::debug!("failed to close connection for client ({handle}) @ {addr}: {e}");
+    }
     let active: Vec<SocketAddr> = conns.lock().await.keys().copied().collect();
     log::info!("active connections: {active:?}");
 }
@@ -735,6 +740,57 @@ async fn disconnect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use std::any::Any;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    struct FailingSendConn {
+        closed: AtomicBool,
+        addr: SocketAddr,
+    }
+
+    #[async_trait]
+    impl Conn for FailingSendConn {
+        async fn connect(&self, _addr: SocketAddr) -> webrtc_util::Result<()> {
+            Ok(())
+        }
+
+        async fn recv(&self, _buf: &mut [u8]) -> webrtc_util::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::UnexpectedEof, "unused").into())
+        }
+
+        async fn recv_from(&self, _buf: &mut [u8]) -> webrtc_util::Result<(usize, SocketAddr)> {
+            Err(io::Error::new(io::ErrorKind::UnexpectedEof, "unused").into())
+        }
+
+        async fn send(&self, _buf: &[u8]) -> webrtc_util::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "send failed").into())
+        }
+
+        async fn send_to(&self, _buf: &[u8], _target: SocketAddr) -> webrtc_util::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "send failed").into())
+        }
+
+        fn local_addr(&self) -> webrtc_util::Result<SocketAddr> {
+            Ok(self.addr)
+        }
+
+        fn remote_addr(&self) -> Option<SocketAddr> {
+            Some(self.addr)
+        }
+
+        async fn close(&self) -> webrtc_util::Result<()> {
+            self.closed.store(true, Ordering::Release);
+            Ok(())
+        }
+
+        fn as_any(&self) -> &(dyn Any + Send + Sync) {
+            self
+        }
+    }
 
     #[test]
     fn attempt_slot_rejects_duplicate_while_connecting() {
@@ -814,5 +870,45 @@ mod tests {
             })
         )));
         assert!(!is_droppable_inbound_event(&ProtoEvent::Leave(0)));
+    }
+
+    #[tokio::test]
+    async fn send_failure_is_returned_to_caller() {
+        let manager = ClientManager::default();
+        let handle = manager.add_client();
+        manager.set_alive(handle, true);
+        let addr: SocketAddr = "127.0.0.1:4242".parse().expect("socket addr");
+        manager.set_active_addr(handle, Some(addr));
+        manager.set_fix_ips(handle, vec![addr.ip()]);
+
+        let conn = Arc::new(FailingSendConn {
+            closed: AtomicBool::new(false),
+            addr,
+        });
+        let (recv_tx, recv_rx) = mpsc::channel(INBOUND_EVENT_QUEUE_CAPACITY);
+        let lm = LanMouseConnection {
+            cert: Certificate::generate_self_signed(vec!["lan-mouse-test".to_owned()])
+                .expect("test certificate"),
+            client_manager: manager,
+            conns: Rc::new(Mutex::new(HashMap::from([(
+                addr,
+                conn.clone() as Arc<dyn Conn + Send + Sync>,
+            )]))),
+            recv_rx,
+            recv_tx,
+            ping_response: Default::default(),
+            primary_hints: Default::default(),
+            fingerprint_hints: Default::default(),
+            attempt_states: Default::default(),
+            last_success_cache_path: None,
+        };
+
+        let err = lm
+            .send(ProtoEvent::Ping, handle)
+            .await
+            .expect_err("send should fail");
+
+        assert!(matches!(err, LanMouseConnectionError::Webrtc(_)));
+        assert!(conn.closed.load(Ordering::Acquire));
     }
 }

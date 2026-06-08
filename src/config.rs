@@ -522,8 +522,11 @@ impl Config {
 
     pub async fn changed(&mut self) -> Result<(), notify::Error> {
         loop {
-            let event = self.watch_rx.recv().await.expect("channel closed");
-            let event = event.expect("filesystem event");
+            let event = match self.watch_rx.recv().await {
+                Some(Ok(event)) => event,
+                Some(Err(e)) => return Err(e),
+                None => return Err(notify::Error::generic("config watcher channel closed")),
+            };
             if event.paths.contains(&self.config_path)
                 && matches!(
                     event.kind,
@@ -648,9 +651,6 @@ impl Config {
 
     /// set configured clients
     pub fn set_clients(&mut self, clients: Vec<ConfigClient>) {
-        if clients.is_empty() {
-            return;
-        }
         if self.config_toml.is_none() {
             self.config_toml = Some(Default::default());
         }
@@ -729,8 +729,26 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use lan_mouse_ipc::{ActionTrigger, ClientAction};
+    use notify::{RecommendedWatcher, Watcher};
     use std::ffi::OsString;
+    use tokio::sync::mpsc;
+
+    fn empty_toml_client() -> TomlClient {
+        TomlClient {
+            hostname: None,
+            host_name: None,
+            peer_fingerprint: None,
+            ips: None,
+            port: None,
+            position: None,
+            activate_on_startup: None,
+            enter_hook: None,
+            leave_hook: None,
+            actions: None,
+        }
+    }
 
     #[test]
     fn split_inline_arg_accepts_exact_match() {
@@ -746,6 +764,58 @@ mod tests {
             split_inline_arg(&OsString::from("--log-file-extra=daemon.log"), "--log-file"),
             None
         );
+    }
+
+    #[test]
+    fn set_clients_persists_empty_client_list() {
+        let (_tx, watch_rx) = mpsc::channel(1);
+        let watcher = RecommendedWatcher::new(|_| {}, notify::Config::default()).expect("watcher");
+        let mut config = Config {
+            args: Args::parse_from(["lan-mouse"]),
+            cert_path: PathBuf::from("lan-mouse.pem"),
+            config_path: PathBuf::from("config.toml"),
+            config_dir: PathBuf::from("."),
+            config_toml: Some(ConfigToml {
+                clients: Some(vec![empty_toml_client()]),
+                ..Default::default()
+            }),
+            watcher,
+            watch_rx,
+        };
+
+        config.set_clients(Vec::new());
+
+        assert_eq!(
+            config
+                .config_toml
+                .as_ref()
+                .and_then(|c| c.clients.as_ref())
+                .map(Vec::len),
+            Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_returns_error_when_watcher_channel_closes() {
+        let (tx, watch_rx) = mpsc::channel(1);
+        drop(tx);
+        let watcher = RecommendedWatcher::new(|_| {}, notify::Config::default()).expect("watcher");
+        let mut config = Config {
+            args: Args::parse_from(["lan-mouse"]),
+            cert_path: PathBuf::from("lan-mouse.pem"),
+            config_path: PathBuf::from("config.toml"),
+            config_dir: PathBuf::from("."),
+            config_toml: Some(ConfigToml::default()),
+            watcher,
+            watch_rx,
+        };
+
+        let err = config
+            .changed()
+            .await
+            .expect_err("closed watcher channel should error");
+
+        assert!(format!("{err}").contains("config watcher channel closed"));
     }
 
     #[test]

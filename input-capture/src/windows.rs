@@ -10,6 +10,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
+use crate::error::WindowsCaptureCreationError;
+
 use super::{Capture, CaptureError, CaptureEvent, Position};
 
 mod display_util;
@@ -64,13 +66,13 @@ impl Capture for WindowsInputCapture {
 }
 
 impl WindowsInputCapture {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new() -> Result<Self, WindowsCaptureCreationError> {
         let (event_tx, event_rx) = channel(1024);
-        let event_thread = EventThread::new(event_tx);
-        Self {
+        let event_thread = EventThread::new(event_tx)?;
+        Ok(Self {
             event_thread,
             event_rx,
-        }
+        })
     }
 }
 
