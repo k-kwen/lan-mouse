@@ -17,7 +17,7 @@ use input_event::{
 use keycode::{KeyMap, KeyMapping};
 use std::cell::Cell;
 use std::collections::HashSet;
-use std::ffi::{CStr, c_char, c_void};
+use std::ffi::c_void;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -203,37 +203,6 @@ fn side_button_cg_number(button: u32) -> Option<i64> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SideButtonRoute {
-    MissionControl,
-    ShowDesktop,
-    NativeMouse,
-}
-
-fn is_chrome_bundle_id(bundle_id: &str) -> bool {
-    matches!(bundle_id, "com.google.Chrome" | "com.google.Chrome.canary")
-}
-
-fn side_button_route_for_bundle(
-    button: u32,
-    frontmost_bundle_id: Option<&str>,
-) -> Option<SideButtonRoute> {
-    let side_button = canonical_side_button(button)?;
-    if frontmost_bundle_id.is_some_and(is_chrome_bundle_id) {
-        return Some(SideButtonRoute::NativeMouse);
-    }
-    match side_button {
-        BTN_BACK => Some(SideButtonRoute::MissionControl),
-        BTN_FORWARD => Some(SideButtonRoute::ShowDesktop),
-        _ => None,
-    }
-}
-
-fn side_button_route(button: u32) -> Option<SideButtonRoute> {
-    let frontmost_bundle_id = frontmost_bundle_identifier();
-    side_button_route_for_bundle(button, frontmost_bundle_id.as_deref())
-}
-
 /// Triggers Mission Control by posting F9 from a `HIDSystemState` event
 /// source — the same low-level path Show Desktop uses (see
 /// `trigger_show_desktop`). HID-state events participate in WindowServer's
@@ -342,108 +311,6 @@ fn autorelease_pool_api() -> Option<&'static AutoreleasePoolApi> {
             })
         })
         .as_ref()
-}
-
-// ---- Frontmost application lookup via NSWorkspace -------------------------
-
-type FnMsgSendCString = unsafe extern "C" fn(ObjcId, ObjcSel) -> *const c_char;
-
-struct FrontmostApplicationApi {
-    nsworkspace_class: ObjcClass,
-    shared_workspace_sel: ObjcSel,
-    frontmost_application_sel: ObjcSel,
-    bundle_identifier_sel: ObjcSel,
-    utf8_string_sel: ObjcSel,
-    msg_send_0: FnMsgSend0,
-    msg_send_cstring: FnMsgSendCString,
-}
-
-unsafe impl Send for FrontmostApplicationApi {}
-unsafe impl Sync for FrontmostApplicationApi {}
-
-static FRONTMOST_APPLICATION_API: std::sync::OnceLock<Option<FrontmostApplicationApi>> =
-    std::sync::OnceLock::new();
-
-fn frontmost_application_api() -> Option<&'static FrontmostApplicationApi> {
-    FRONTMOST_APPLICATION_API
-        .get_or_init(|| unsafe {
-            let _appkit = dlopen(
-                c"/System/Library/Frameworks/AppKit.framework/AppKit".as_ptr(),
-                RTLD_LAZY,
-            );
-            let get_class = dlsym(RTLD_DEFAULT, c"objc_getClass".as_ptr());
-            let sel_register = dlsym(RTLD_DEFAULT, c"sel_registerName".as_ptr());
-            let msg_send = dlsym(RTLD_DEFAULT, c"objc_msgSend".as_ptr());
-            if get_class.is_null() || sel_register.is_null() || msg_send.is_null() {
-                log::warn!("frontmost-app: objc runtime missing");
-                return None;
-            }
-            let get_class: FnObjcGetClass = std::mem::transmute(get_class);
-            let sel_register: FnSelRegisterName = std::mem::transmute(sel_register);
-            let msg_send_0: FnMsgSend0 = std::mem::transmute(msg_send);
-            let msg_send_cstring: FnMsgSendCString = std::mem::transmute(msg_send);
-
-            let nsworkspace_class = get_class(c"NSWorkspace".as_ptr());
-            if nsworkspace_class.is_null() {
-                log::warn!("frontmost-app: NSWorkspace class not found");
-                return None;
-            }
-            Some(FrontmostApplicationApi {
-                nsworkspace_class,
-                shared_workspace_sel: sel_register(c"sharedWorkspace".as_ptr()),
-                frontmost_application_sel: sel_register(c"frontmostApplication".as_ptr()),
-                bundle_identifier_sel: sel_register(c"bundleIdentifier".as_ptr()),
-                utf8_string_sel: sel_register(c"UTF8String".as_ptr()),
-                msg_send_0,
-                msg_send_cstring,
-            })
-        })
-        .as_ref()
-}
-
-fn frontmost_bundle_identifier() -> Option<String> {
-    let frontmost = frontmost_application_api()?;
-    let pool_api = autorelease_pool_api();
-    unsafe {
-        let pool = pool_api.map(|p| {
-            let alloc = (p.msg_send_0)(p.nsautoreleasepool_class, p.alloc_sel);
-            if alloc.is_null() {
-                std::ptr::null()
-            } else {
-                (p.msg_send_0)(alloc, p.init_sel)
-            }
-        });
-
-        let workspace =
-            (frontmost.msg_send_0)(frontmost.nsworkspace_class, frontmost.shared_workspace_sel);
-        let result = if workspace.is_null() {
-            None
-        } else {
-            let app = (frontmost.msg_send_0)(workspace, frontmost.frontmost_application_sel);
-            if app.is_null() {
-                None
-            } else {
-                let bundle_id = (frontmost.msg_send_0)(app, frontmost.bundle_identifier_sel);
-                if bundle_id.is_null() {
-                    None
-                } else {
-                    let raw = (frontmost.msg_send_cstring)(bundle_id, frontmost.utf8_string_sel);
-                    if raw.is_null() {
-                        None
-                    } else {
-                        CStr::from_ptr(raw).to_str().ok().map(ToOwned::to_owned)
-                    }
-                }
-            }
-        };
-
-        if let (Some(p), Some(pool_obj)) = (pool_api, pool) {
-            if !pool_obj.is_null() {
-                let _ = (p.msg_send_0)(pool_obj, p.drain_sel);
-            }
-        }
-        result
-    }
 }
 
 // ---- NSEvent media-key synthesis via Objective-C runtime + dlsym ----------
@@ -798,45 +665,31 @@ impl Emulation for MacOSEmulation {
                         button,
                         state,
                     } => {
-                        // Route side buttons to native browser back/forward
-                        // only for Chrome. Everywhere else keeps the existing
-                        // F9/F11 behavior. Accept both lan-mouse's evdev
-                        // BTN_BACK/FORWARD constants and raw macOS OtherMouse
-                        // button numbers 3/4.
+                        // Route side buttons to F9/F11 unconditionally. Accept
+                        // both lan-mouse's evdev BTN_BACK/FORWARD constants and
+                        // raw macOS OtherMouse button numbers 3/4 so older or
+                        // platform-specific peers do not fall through as normal
+                        // back/forward mouse events.
                         if let Some(side_button) = canonical_side_button(button) {
-                            if state != 1 {
-                                if self.synth_keyed_buttons.remove(&side_button) {
-                                    // matching release for a synth-routed press
-                                    return Ok(());
+                            if state == 1 {
+                                if side_button == BTN_BACK {
+                                    log::info!(
+                                        "side mouse button {} (raw={button}) -> F9 / Mission Control",
+                                        side_button_name(side_button)
+                                    );
+                                    trigger_mission_control();
+                                } else {
+                                    log::info!(
+                                        "side mouse button {} (raw={button}) -> F11 / Show Desktop",
+                                        side_button_name(side_button)
+                                    );
+                                    trigger_show_desktop();
                                 }
-                            } else {
-                                match side_button_route(button) {
-                                    Some(SideButtonRoute::NativeMouse) => {
-                                        log::info!(
-                                            "side mouse button {} (raw={button}) -> native mouse event for Chrome",
-                                            side_button_name(side_button)
-                                        );
-                                    }
-                                    Some(SideButtonRoute::MissionControl) => {
-                                        log::info!(
-                                            "side mouse button {} (raw={button}) -> F9 / Mission Control",
-                                            side_button_name(side_button)
-                                        );
-                                        trigger_mission_control();
-                                        self.synth_keyed_buttons.insert(side_button);
-                                        return Ok(());
-                                    }
-                                    Some(SideButtonRoute::ShowDesktop) => {
-                                        log::info!(
-                                            "side mouse button {} (raw={button}) -> F11 / Show Desktop",
-                                            side_button_name(side_button)
-                                        );
-                                        trigger_show_desktop();
-                                        self.synth_keyed_buttons.insert(side_button);
-                                        return Ok(());
-                                    }
-                                    None => {}
-                                }
+                                self.synth_keyed_buttons.insert(side_button);
+                                return Ok(());
+                            } else if self.synth_keyed_buttons.remove(&side_button) {
+                                // matching release for a synth-routed press
+                                return Ok(());
                             }
                         }
                         // button number for OtherMouse events (3 = back, 4 = forward, etc.)
@@ -848,10 +701,10 @@ impl Emulation for MacOSEmulation {
                             (BTN_RIGHT, 0) => (CGEventType::RightMouseUp, CGMouseButton::Right),
                             (BTN_MIDDLE, 1) => (CGEventType::OtherMouseDown, CGMouseButton::Center),
                             (BTN_MIDDLE, 0) => (CGEventType::OtherMouseUp, CGMouseButton::Center),
-                            (_, 1) if canonical_side_button(button).is_some() => {
+                            (BTN_BACK, 1) | (BTN_FORWARD, 1) => {
                                 (CGEventType::OtherMouseDown, CGMouseButton::Center)
                             }
-                            (_, 0) if canonical_side_button(button).is_some() => {
+                            (BTN_BACK, 0) | (BTN_FORWARD, 0) => {
                                 (CGEventType::OtherMouseUp, CGMouseButton::Center)
                             }
                             _ => {
@@ -1187,58 +1040,6 @@ bitflags! {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn chrome_routes_side_buttons_as_native_mouse_events() {
-        assert_eq!(
-            side_button_route_for_bundle(BTN_BACK, Some("com.google.Chrome")),
-            Some(SideButtonRoute::NativeMouse)
-        );
-        assert_eq!(
-            side_button_route_for_bundle(BTN_FORWARD, Some("com.google.Chrome")),
-            Some(SideButtonRoute::NativeMouse)
-        );
-        assert_eq!(
-            side_button_route_for_bundle(3, Some("com.google.Chrome")),
-            Some(SideButtonRoute::NativeMouse)
-        );
-        assert_eq!(
-            side_button_route_for_bundle(4, Some("com.google.Chrome")),
-            Some(SideButtonRoute::NativeMouse)
-        );
-        assert_eq!(
-            side_button_route_for_bundle(BTN_BACK, Some("com.google.Chrome.canary")),
-            Some(SideButtonRoute::NativeMouse)
-        );
-    }
-
-    #[test]
-    fn non_chrome_routes_side_buttons_to_existing_function_keys() {
-        assert_eq!(
-            side_button_route_for_bundle(BTN_BACK, Some("com.apple.finder")),
-            Some(SideButtonRoute::MissionControl)
-        );
-        assert_eq!(
-            side_button_route_for_bundle(BTN_FORWARD, Some("com.apple.finder")),
-            Some(SideButtonRoute::ShowDesktop)
-        );
-        assert_eq!(
-            side_button_route_for_bundle(3, None),
-            Some(SideButtonRoute::MissionControl)
-        );
-        assert_eq!(
-            side_button_route_for_bundle(4, None),
-            Some(SideButtonRoute::ShowDesktop)
-        );
-    }
-
-    #[test]
-    fn non_side_buttons_do_not_use_side_button_routing() {
-        assert_eq!(
-            side_button_route_for_bundle(BTN_LEFT, Some("com.google.Chrome")),
-            None
-        );
-    }
 
     #[test]
     fn right_alt_evdev_maps_to_right_option_keycode() {
