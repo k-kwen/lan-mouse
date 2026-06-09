@@ -445,6 +445,29 @@ unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
         return LRESULT(1);
     };
 
+    // Before forwarding a modifier transition, resync the guest's absolute
+    // modifier state from HELD_MODIFIERS (kept accurate by this local hook
+    // even when a forwarded key-up is dropped over UDP). Sent ahead of the
+    // transition so the guest self-heals a modifier stranded by a lost
+    // release — e.g. a stuck Ctrl/Win that would otherwise ride along in the
+    // injected flags and block the remote IME's bare right-Option toggle.
+    // Best-effort only: the transport is DTLS-over-UDP, so this resync may be
+    // dropped or reordered relative to the key. The next modifier transition
+    // re-sends the absolute state and the guest's idle self-heal is the
+    // backstop, so a lost/reordered resync degrades rather than breaks. A full
+    // local queue is handled by the key send below.
+    if let KeyboardEvent::Key { key, .. } = key_event {
+        if Linux::try_from(key).is_ok_and(is_modifier) {
+            let resync = KeyboardEvent::Modifiers {
+                depressed: held_modifiers_mask(),
+                latched: 0,
+                locked: 0,
+                group: 0,
+            };
+            let _ = try_send_event(client, CaptureEvent::Input(Event::Keyboard(resync)));
+        }
+    }
+
     if let Err(e) = try_send_event(client, CaptureEvent::Input(Event::Keyboard(key_event))) {
         match e {
             TrySendError::Full(_) => {
@@ -519,6 +542,32 @@ fn track_forwarded_modifier(event: KeyboardEvent) {
         }
         _ => {}
     });
+}
+
+/// Absolute mask of the currently-held modifiers, encoded in the same `XMods`
+/// bit layout the emulation side uses (`input-emulation` macos.rs `XMods`):
+/// Shift=1<<0, Ctrl=1<<2, Alt(Mod1)=1<<3, Meta/Win(Mod4)=1<<6. CapsLock is
+/// intentionally omitted — it is not tracked in `HELD_MODIFIERS` and is
+/// irrelevant to the downstream modifier-gesture detection. `HELD_MODIFIERS`
+/// is maintained by the local low-level hook, so it stays accurate even when
+/// a forwarded key-up is dropped over UDP; sending it as an absolute
+/// `Modifiers` resync lets the guest self-heal a stranded modifier.
+fn held_modifiers_mask() -> u32 {
+    const SHIFT: u32 = 1 << 0;
+    const CONTROL: u32 = 1 << 2;
+    const MOD1: u32 = 1 << 3; // Alt
+    const MOD4: u32 = 1 << 6; // Meta / Windows
+    HELD_MODIFIERS.with_borrow(|held| {
+        held.iter().fold(0u32, |mask, key| {
+            mask | match *key {
+                Linux::KeyLeftShift | Linux::KeyRightShift => SHIFT,
+                Linux::KeyLeftCtrl | Linux::KeyRightCtrl => CONTROL,
+                Linux::KeyLeftAlt | Linux::KeyRightalt => MOD1,
+                Linux::KeyLeftMeta | Linux::KeyRightmeta => MOD4,
+                _ => 0,
+            }
+        })
+    })
 }
 
 fn flush_held_modifiers_to_os() {

@@ -36,6 +36,16 @@ use super::error::MacOSEmulationCreationError;
 const DEFAULT_REPEAT_DELAY: Duration = Duration::from_millis(500);
 const DEFAULT_REPEAT_INTERVAL: Duration = Duration::from_millis(32);
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
+/// After this much idle time on the keyboard channel, treat any still-held
+/// modifier or running key-repeat as stranded (a press/release lost over
+/// unreliable UDP) and self-heal before processing the next key. Long enough
+/// not to disturb active typing or a brief deliberate modifier hold; short
+/// enough to clear a stuck Cmd/Ctrl before the user's next toggle press.
+const STUCK_RESET_IDLE: Duration = Duration::from_millis(800);
+/// Hard upper bound on auto-repeat cycles for a single held key, so a lost
+/// key-up can never drive an unbounded repeat flood into the focused app
+/// (~10s at DEFAULT_REPEAT_INTERVAL — far beyond any real key hold).
+const MAX_KEY_REPEATS: u32 = 300;
 
 /// Per-axis scale applied to incoming pointer motion deltas before they
 /// are turned into mouse-move events. macOS's `mouse.scaling` preference
@@ -65,6 +75,10 @@ pub(crate) struct MacOSEmulation {
     modifier_state: Rc<Cell<XMods>>,
     /// notify to cancel key repeats
     notify_repeat_task: Arc<Notify>,
+    /// timestamp of the last processed keyboard event, used to detect an idle
+    /// gap after which still-held state is likely stranded (a release lost
+    /// over UDP) and should be self-healed before the next key.
+    last_keyboard_event: Option<Instant>,
 }
 
 /// Maps an evdev button code to the CGEventType used for drag events.
@@ -95,6 +109,7 @@ impl MacOSEmulation {
             repeat_task: None,
             notify_repeat_task: Arc::new(Notify::new()),
             modifier_state: Rc::new(Cell::new(XMods::empty())),
+            last_keyboard_event: None,
         })
     }
 
@@ -119,8 +134,17 @@ impl MacOSEmulation {
                 _ = notify.notified() => true,
             };
             if !stop {
+                let mut repeats: u32 = 0;
                 loop {
                     key_event(event_source.clone(), key, 1, modifiers.get());
+                    repeats += 1;
+                    if repeats >= MAX_KEY_REPEATS {
+                        log::warn!(
+                            "key {key} hit repeat safety limit ({MAX_KEY_REPEATS}); \
+                             releasing — a key-up was likely lost"
+                        );
+                        break;
+                    }
                     tokio::select! {
                         _ = tokio::time::sleep(DEFAULT_REPEAT_INTERVAL) => {},
                         _ = notify.notified() => break,
@@ -1040,6 +1064,37 @@ impl Emulation for MacOSEmulation {
                     key,
                     state,
                 } => {
+                    // Self-heal state stranded by a release lost over UDP. The
+                    // guest tracks modifiers incrementally, so a dropped
+                    // key-up leaves a modifier stuck in `modifier_state`,
+                    // injected into every later event's flags — which makes a
+                    // downstream IME see 2 modifiers and abort its bare
+                    // right-Option toggle. After an idle gap on the keyboard
+                    // channel, cancel any runaway key-repeat, and — only when
+                    // this event is itself a modifier *press* (e.g. the toggle
+                    // key) — drop the stale modifier set first so that press
+                    // is evaluated clean. Restricting the clear to modifier
+                    // presses preserves a legitimately-held modifier across a
+                    // pause followed by a normal keystroke. With the Windows
+                    // capture's absolute `Modifiers` resync deployed, the
+                    // resync clears the staleness first and refreshes the idle
+                    // clock, so this path is only a backstop for a dropped
+                    // resync.
+                    let now = Instant::now();
+                    let idle = self
+                        .last_keyboard_event
+                        .is_some_and(|t| now.duration_since(t) >= STUCK_RESET_IDLE);
+                    self.last_keyboard_event = Some(now);
+                    if idle {
+                        self.cancel_repeat_task().await;
+                        if state == 1
+                            && evdev_is_modifier(key)
+                            && !self.modifier_state.get().is_empty()
+                        {
+                            self.modifier_state.set(XMods::empty());
+                            modifier_event(self.event_source.clone(), XMods::empty(), None);
+                        }
+                    }
                     // System-shortcut function keys: macOS rejects CGEvent-
                     // synthesized triggers for system shortcuts (the same
                     // policy that makes synthetic F18/Ctrl+Space fail for
@@ -1119,6 +1174,12 @@ impl Emulation for MacOSEmulation {
                 } => {
                     set_modifiers(&self.modifier_state, depressed, latched, locked, group);
                     modifier_event(self.event_source.clone(), self.modifier_state.get(), None);
+                    // This absolute resync is authoritative; refresh the idle
+                    // clock so an immediately-following `Key` (e.g. the Windows
+                    // capture sends `Modifiers` right before each modifier key)
+                    // does not re-trigger the Key-arm idle self-heal and undo
+                    // a modifier this resync just correctly set.
+                    self.last_keyboard_event = Some(Instant::now());
                 }
             },
         }
@@ -1162,6 +1223,23 @@ impl Emulation for MacOSEmulation {
         let _ = CGDisplay::warp_mouse_cursor_position(pt);
         Ok(())
     }
+}
+
+/// Whether an evdev key code is a modifier key — mirrors the set that
+/// `update_modifiers` maps to a non-empty `XMods` mask.
+fn evdev_is_modifier(key: u32) -> bool {
+    matches!(
+        scancode::Linux::try_from(key),
+        Ok(scancode::Linux::KeyLeftShift
+            | scancode::Linux::KeyRightShift
+            | scancode::Linux::KeyCapsLock
+            | scancode::Linux::KeyLeftCtrl
+            | scancode::Linux::KeyRightCtrl
+            | scancode::Linux::KeyLeftAlt
+            | scancode::Linux::KeyRightalt
+            | scancode::Linux::KeyLeftMeta
+            | scancode::Linux::KeyRightmeta)
+    )
 }
 
 fn update_modifiers(modifiers: &Cell<XMods>, key: u32, state: u8) -> bool {
@@ -1306,5 +1384,31 @@ mod tests {
             macos_keycode_from_evdev(scancode::Linux::KeyRightalt as u32),
             Some(MACOS_RIGHT_OPTION)
         );
+    }
+
+    #[test]
+    fn evdev_is_modifier_matches_modifier_keys_only() {
+        // Modifier keys (the set update_modifiers maps to an XMods bit) gate
+        // the idle self-heal's modifier clear.
+        for key in [
+            scancode::Linux::KeyLeftShift,
+            scancode::Linux::KeyLeftCtrl,
+            scancode::Linux::KeyRightalt,
+            scancode::Linux::KeyLeftMeta,
+        ] {
+            assert!(evdev_is_modifier(key as u32), "{key:?} should be a modifier");
+        }
+        for key in [
+            scancode::Linux::KeyA,
+            scancode::Linux::Key1,
+            scancode::Linux::KeySpace,
+        ] {
+            assert!(
+                !evdev_is_modifier(key as u32),
+                "{key:?} should not be a modifier"
+            );
+        }
+        // an out-of-range evdev code is not a modifier
+        assert!(!evdev_is_modifier(u32::MAX));
     }
 }
