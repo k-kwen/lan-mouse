@@ -10,6 +10,14 @@ use core_graphics::event::{
     ScrollEventUnit,
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+use core_foundation::base::{CFType, TCFType};
+use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
+use core_foundation::number::CFNumber;
+use core_foundation::string::CFString;
+use core_graphics::window::{
+    copy_window_info, kCGNullWindowID, kCGWindowLayer, kCGWindowListExcludeDesktopElements,
+    kCGWindowListOptionOnScreenOnly, kCGWindowOwnerPID,
+};
 use input_event::{
     BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent,
     scancode,
@@ -344,17 +352,27 @@ fn autorelease_pool_api() -> Option<&'static AutoreleasePoolApi> {
         .as_ref()
 }
 
-// ---- Frontmost application lookup via NSWorkspace -------------------------
+// ---- Frontmost application lookup ----------------------------------------
+//
+// The lan-mouse daemon has no AppKit run loop, so
+// `NSWorkspace.frontmostApplication` is never refreshed by activation
+// notifications: it stays frozen at whatever happened to be frontmost when the
+// process first queried it. That made Chrome detection a coin flip depending on
+// what was focused at daemon start. Instead we ask the WindowServer for the
+// on-screen window list (a fresh query on every call, no run loop required) to
+// find the frontmost regular window's owner pid, then resolve that pid to a
+// bundle id via `NSRunningApplication`.
 
+type FnMsgSendPid = unsafe extern "C" fn(ObjcId, ObjcSel, i32) -> ObjcId;
 type FnMsgSendCString = unsafe extern "C" fn(ObjcId, ObjcSel) -> *const c_char;
 
 struct FrontmostApplicationApi {
-    nsworkspace_class: ObjcClass,
-    shared_workspace_sel: ObjcSel,
-    frontmost_application_sel: ObjcSel,
+    running_application_class: ObjcClass,
+    running_application_with_pid_sel: ObjcSel,
     bundle_identifier_sel: ObjcSel,
     utf8_string_sel: ObjcSel,
     msg_send_0: FnMsgSend0,
+    msg_send_pid: FnMsgSendPid,
     msg_send_cstring: FnMsgSendCString,
 }
 
@@ -381,28 +399,67 @@ fn frontmost_application_api() -> Option<&'static FrontmostApplicationApi> {
             let get_class: FnObjcGetClass = std::mem::transmute(get_class);
             let sel_register: FnSelRegisterName = std::mem::transmute(sel_register);
             let msg_send_0: FnMsgSend0 = std::mem::transmute(msg_send);
+            let msg_send_pid: FnMsgSendPid = std::mem::transmute(msg_send);
             let msg_send_cstring: FnMsgSendCString = std::mem::transmute(msg_send);
 
-            let nsworkspace_class = get_class(c"NSWorkspace".as_ptr());
-            if nsworkspace_class.is_null() {
-                log::warn!("frontmost-app: NSWorkspace class not found");
+            let running_application_class = get_class(c"NSRunningApplication".as_ptr());
+            if running_application_class.is_null() {
+                log::warn!("frontmost-app: NSRunningApplication class not found");
                 return None;
             }
             Some(FrontmostApplicationApi {
-                nsworkspace_class,
-                shared_workspace_sel: sel_register(c"sharedWorkspace".as_ptr()),
-                frontmost_application_sel: sel_register(c"frontmostApplication".as_ptr()),
+                running_application_class,
+                running_application_with_pid_sel: sel_register(
+                    c"runningApplicationWithProcessIdentifier:".as_ptr(),
+                ),
                 bundle_identifier_sel: sel_register(c"bundleIdentifier".as_ptr()),
                 utf8_string_sel: sel_register(c"UTF8String".as_ptr()),
                 msg_send_0,
+                msg_send_pid,
                 msg_send_cstring,
             })
         })
         .as_ref()
 }
 
+/// Returns the pid that owns the frontmost on-screen regular window, queried
+/// fresh from the WindowServer (no AppKit run loop required). Reading only the
+/// owner pid and window layer needs no Screen Recording permission.
+fn frontmost_window_pid() -> Option<i64> {
+    let options = kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements;
+    let window_list = copy_window_info(options, kCGNullWindowID)?;
+    let layer_key = unsafe { CFString::wrap_under_get_rule(kCGWindowLayer) };
+    let owner_pid_key = unsafe { CFString::wrap_under_get_rule(kCGWindowOwnerPID) };
+    // Windows come back front-to-back; the first one at the normal window layer
+    // (0) belongs to the frontmost regular application (menu bar, dock, status
+    // items and the like sit on higher layers).
+    for window in window_list.iter() {
+        let dict_ref = (*window) as CFDictionaryRef;
+        if dict_ref.is_null() {
+            continue;
+        }
+        let dict = unsafe { CFDictionary::<CFString, CFType>::wrap_under_get_rule(dict_ref) };
+        let layer = dict
+            .find(&layer_key)
+            .and_then(|v| v.downcast::<CFNumber>())
+            .and_then(|n| n.to_i64());
+        if layer != Some(0) {
+            continue;
+        }
+        if let Some(pid) = dict
+            .find(&owner_pid_key)
+            .and_then(|v| v.downcast::<CFNumber>())
+            .and_then(|n| n.to_i64())
+        {
+            return Some(pid);
+        }
+    }
+    None
+}
+
 fn frontmost_bundle_identifier() -> Option<String> {
-    let frontmost = frontmost_application_api()?;
+    let pid = frontmost_window_pid()?;
+    let api = frontmost_application_api()?;
     let pool_api = autorelease_pool_api();
     unsafe {
         let pool = pool_api.map(|p| {
@@ -414,25 +471,26 @@ fn frontmost_bundle_identifier() -> Option<String> {
             }
         });
 
-        let workspace =
-            (frontmost.msg_send_0)(frontmost.nsworkspace_class, frontmost.shared_workspace_sel);
-        let result = if workspace.is_null() {
+        // +[NSRunningApplication runningApplicationWithProcessIdentifier:] does a
+        // live LaunchServices lookup, so it does not depend on a run loop the way
+        // NSWorkspace's cached frontmostApplication does.
+        let app = (api.msg_send_pid)(
+            api.running_application_class,
+            api.running_application_with_pid_sel,
+            pid as i32,
+        );
+        let result = if app.is_null() {
             None
         } else {
-            let app = (frontmost.msg_send_0)(workspace, frontmost.frontmost_application_sel);
-            if app.is_null() {
+            let bundle_id = (api.msg_send_0)(app, api.bundle_identifier_sel);
+            if bundle_id.is_null() {
                 None
             } else {
-                let bundle_id = (frontmost.msg_send_0)(app, frontmost.bundle_identifier_sel);
-                if bundle_id.is_null() {
+                let raw = (api.msg_send_cstring)(bundle_id, api.utf8_string_sel);
+                if raw.is_null() {
                     None
                 } else {
-                    let raw = (frontmost.msg_send_cstring)(bundle_id, frontmost.utf8_string_sel);
-                    if raw.is_null() {
-                        None
-                    } else {
-                        CStr::from_ptr(raw).to_str().ok().map(ToOwned::to_owned)
-                    }
+                    CStr::from_ptr(raw).to_str().ok().map(ToOwned::to_owned)
                 }
             }
         };
