@@ -302,6 +302,13 @@ fn start_routine(
                 x if x == RequestType::Exit as usize => break,
                 x if x == RequestType::Release as usize => {
                     ACTIVE_CLIENT.take();
+                    // Once capture is inactive the hook passes events
+                    // through without tracking, so a modifier released
+                    // after this point never removes itself — and the
+                    // stale entry would ride along in every absolute
+                    // Modifiers resync of the NEXT session, re-poisoning
+                    // the guest with a phantom modifier.
+                    HELD_MODIFIERS.with_borrow_mut(|held| held.clear());
                 }
                 x if x == RequestType::ClientUpdate as usize => {
                     let requests = {
@@ -719,6 +726,8 @@ fn update_clients(request: ClientUpdate) {
             if let Some(active_pos) = ACTIVE_CLIENT.get() {
                 if pos == active_pos {
                     let _ = ACTIVE_CLIENT.take();
+                    // Same rationale as the Release request above.
+                    HELD_MODIFIERS.with_borrow_mut(|held| held.clear());
                 }
             }
             CLIENTS.with_borrow_mut(|clients| clients.remove(&pos));
