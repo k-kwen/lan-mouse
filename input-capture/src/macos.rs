@@ -771,6 +771,10 @@ extern "C" fn display_reconfiguration_callback(_display: u32, flags: u32, user_i
 
 pub struct MacOSInputCapture {
     event_rx: Receiver<(Position, CaptureEvent)>,
+    /// Fatal backend errors (event-tap death) surfaced by the
+    /// producer task; polled with priority in `poll_next` so the
+    /// stream yields `Err` instead of going silently quiet.
+    error_rx: Receiver<CaptureError>,
     notify_tx: Sender<ProducerEvent>,
     run_loop: CFRunLoop,
 }
@@ -781,6 +785,7 @@ impl MacOSInputCapture {
 
         let state = Arc::new(Mutex::new(InputCaptureState::new()?));
         let (event_tx, event_rx) = mpsc::channel(32);
+        let (error_tx, error_rx) = mpsc::channel(1);
         let (notify_tx, mut notify_rx) = mpsc::channel(32);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (tap_exit_tx, mut tap_exit_rx) = oneshot::channel();
@@ -813,9 +818,17 @@ impl MacOSInputCapture {
                             break;
                         };
                         let mut state = state.lock().await;
-                        state.handle_producer_event(producer_event).await.unwrap_or_else(|e| {
+                        if let Err(e) = state.handle_producer_event(producer_event).await {
                             log::error!("Failed to handle producer event: {e}");
-                        })
+                            // Tap death is fatal for this backend: surface
+                            // it through the capture stream so the service
+                            // can send Leave and auto-restart the backend.
+                            // Swallowing it here leaves capture silently
+                            // dead with no recovery path.
+                            if matches!(e, CaptureError::EventTapDisabled) {
+                                let _ = error_tx.try_send(e);
+                            }
+                        }
                     }
                     _ = &mut tap_exit_rx => break,
                 }
@@ -826,6 +839,7 @@ impl MacOSInputCapture {
 
         Ok(Self {
             event_rx,
+            error_rx,
             notify_tx,
             run_loop,
         })
@@ -917,6 +931,12 @@ impl Stream for MacOSInputCapture {
     type Item = Result<(Position, CaptureEvent), CaptureError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // Backend errors take priority: a dead event tap leaves the
+        // event channel open but silent, so without this the error
+        // would never surface to the consumer.
+        if let Poll::Ready(Some(e)) = self.error_rx.poll_recv(cx) {
+            return Poll::Ready(Some(Err(e)));
+        }
         match ready!(self.event_rx.poll_recv(cx)) {
             None => Poll::Ready(None),
             Some(e) => Poll::Ready(Some(Ok(e))),

@@ -359,7 +359,16 @@ impl CaptureTask {
         loop {
             tokio::select! {
                 event = capture.next() => match event {
-                    Some(event) => self.handle_capture_event(capture, event?).await?,
+                    Some(Ok(event)) => self.handle_capture_event(capture, event).await?,
+                    Some(Err(e)) => {
+                        // Backend died mid-session (e.g. macOS event
+                        // tap disabled). Drain held keys and tell the
+                        // peer we're gone before propagating, so the
+                        // guest isn't left entered with stuck input
+                        // while we tear down and auto-retry.
+                        self.notify_peer_of_leave(capture).await;
+                        return Err(e.into());
+                    }
                     None => return Ok(()),
                 },
                 (handle, event) = self.conn.recv() => {
