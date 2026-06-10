@@ -637,7 +637,10 @@ unsafe extern "system" fn window_proc(
                 flush_held_modifiers_to_os();
                 if let Some(pos) = ACTIVE_CLIENT.take() {
                     log::info!("host session locked mid-capture; releasing");
-                    let _ = try_send_event(pos, CaptureEvent::AutoRelease);
+                    // Must not be fire-and-forget: ACTIVE_CLIENT is
+                    // already taken, so if this event is lost the peer
+                    // stays entered with no Leave ever sent.
+                    dispatch_auto_release(pos);
                 } else {
                     log::info!("host session locked");
                 }
