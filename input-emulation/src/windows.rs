@@ -26,6 +26,10 @@ use super::{Emulation, EmulationHandle};
 
 const DEFAULT_REPEAT_DELAY: Duration = Duration::from_millis(500);
 const DEFAULT_REPEAT_INTERVAL: Duration = Duration::from_millis(32);
+/// Safety net against a lost key-up over UDP: without a cap the
+/// repeat task floods the focused app forever. Mirrors the macOS
+/// backend's limit (input-emulation/src/macos.rs).
+const MAX_KEY_REPEATS: u32 = 300;
 
 pub(crate) struct WindowsEmulation {
     repeat_task: Option<AbortHandle>,
@@ -129,8 +133,18 @@ impl WindowsEmulation {
         self.kill_repeat_task();
         let repeat_task = tokio::task::spawn_local(async move {
             tokio::time::sleep(DEFAULT_REPEAT_DELAY).await;
+            let mut repeats: u32 = 0;
             loop {
                 key_event(key, 1);
+                repeats += 1;
+                if repeats >= MAX_KEY_REPEATS {
+                    log::warn!(
+                        "key {key} hit repeat safety limit ({MAX_KEY_REPEATS}); \
+                         releasing — a key-up was likely lost"
+                    );
+                    key_event(key, 0);
+                    break;
+                }
                 tokio::time::sleep(DEFAULT_REPEAT_INTERVAL).await;
             }
         });
