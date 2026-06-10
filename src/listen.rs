@@ -150,7 +150,7 @@ impl LanMouseListener {
         // 4-tuple matching. Per-IP binds make replies symmetric
         // automatically: each listener's reply socket is bound to a
         // specific IP, so the kernel uses *that* IP as source.
-        let initial_addrs = enumerate_listenable_ipv4();
+        let initial_addrs = enumerate_listenable_ipv4().unwrap_or_default();
         if initial_addrs.is_empty() {
             // Fall back to 0.0.0.0 so we at least listen somewhere if
             // interface enumeration fails (very unusual).
@@ -297,23 +297,28 @@ async fn send_listen_event(tx: &Sender<ListenEvent>, event: ListenEvent) -> bool
 /// (169.254.0.0/16) since neither is reachable from a peer. IPv6
 /// is intentionally omitted — lan-mouse is IPv4-only on the wire
 /// today.
-fn enumerate_listenable_ipv4() -> Vec<IpAddr> {
+/// `None` means enumeration itself failed — callers must not confuse
+/// that with a genuinely empty interface list, or a transient OS error
+/// turns into "drop every listener".
+fn enumerate_listenable_ipv4() -> Option<Vec<IpAddr>> {
     let ifaces = match if_addrs::get_if_addrs() {
         Ok(v) => v,
         Err(e) => {
             log::warn!("get_if_addrs failed: {e}");
-            return Vec::new();
+            return None;
         }
     };
-    ifaces
-        .into_iter()
-        .filter_map(|iface| match iface.addr {
-            if_addrs::IfAddr::V4(v4) => Some(v4.ip),
-            if_addrs::IfAddr::V6(_) => None,
-        })
-        .filter(|ip| !ip.is_loopback() && !ip.is_link_local())
-        .map(IpAddr::V4)
-        .collect()
+    Some(
+        ifaces
+            .into_iter()
+            .filter_map(|iface| match iface.addr {
+                if_addrs::IfAddr::V4(v4) => Some(v4.ip),
+                if_addrs::IfAddr::V6(_) => None,
+            })
+            .filter(|ip| !ip.is_loopback() && !ip.is_link_local())
+            .map(IpAddr::V4)
+            .collect(),
+    )
 }
 
 async fn try_bind_listener(
@@ -446,11 +451,35 @@ fn spawn_supervisor_task(
         // Skip the immediate-first tick — we just enumerated at startup
         // and don't want to thrash listeners on the first iteration.
         reconcile_tick.tick().await;
+        // Consecutive all-empty enumerations. A single empty result
+        // right after sleep/wake or an interface flap is usually
+        // transient — dropping every inbound listener on it would
+        // leave the daemon unreachable until the next tick.
+        let mut empty_enumerations = 0u32;
         loop {
             tokio::select! {
                 _ = reconcile_tick.tick() => {
-                    let current_ips: HashSet<IpAddr> =
-                        enumerate_listenable_ipv4().into_iter().collect();
+                    let Some(current_ips) = enumerate_listenable_ipv4() else {
+                        log::warn!(
+                            "reconcile: interface enumeration failed; \
+                             keeping current listeners"
+                        );
+                        continue;
+                    };
+                    if current_ips.is_empty() {
+                        empty_enumerations += 1;
+                        if empty_enumerations < 2 {
+                            log::warn!(
+                                "reconcile: no listenable IPv4 addresses (transient?); \
+                                 keeping {} listener(s) until confirmed next tick",
+                                listeners.len()
+                            );
+                            continue;
+                        }
+                    } else {
+                        empty_enumerations = 0;
+                    }
+                    let current_ips: HashSet<IpAddr> = current_ips.into_iter().collect();
                     let to_drop: Vec<IpAddr> = listeners
                         .keys()
                         .filter(|ip| !current_ips.contains(*ip))
@@ -541,7 +570,7 @@ fn spawn_supervisor_task(
                     };
                     listeners.clear(); // Drop aborts each accept task
                     let mut bound = 0usize;
-                    let addrs = enumerate_listenable_ipv4();
+                    let addrs = enumerate_listenable_ipv4().unwrap_or_default();
                     for ip in &addrs {
                         match try_bind_listener(*ip, new_port, &cfg).await {
                             Ok(l) => {
