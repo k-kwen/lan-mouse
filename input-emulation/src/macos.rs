@@ -1,6 +1,10 @@
 use super::{Emulation, EmulationHandle, error::EmulationError};
 use async_trait::async_trait;
 use bitflags::bitflags;
+use core_foundation::base::{CFType, TCFType};
+use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
+use core_foundation::number::CFNumber;
+use core_foundation::string::CFString;
 use core_graphics::base::CGFloat;
 use core_graphics::display::{
     CGDirectDisplayID, CGDisplay, CGDisplayBounds, CGGetDisplaysWithRect, CGPoint, CGRect, CGSize,
@@ -10,10 +14,6 @@ use core_graphics::event::{
     ScrollEventUnit,
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
-use core_foundation::base::{CFType, TCFType};
-use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
-use core_foundation::number::CFNumber;
-use core_foundation::string::CFString;
 use core_graphics::window::{
     copy_window_info, kCGNullWindowID, kCGWindowLayer, kCGWindowListExcludeDesktopElements,
     kCGWindowListOptionOnScreenOnly, kCGWindowOwnerPID,
@@ -1400,7 +1400,10 @@ mod tests {
             scancode::Linux::KeyRightalt,
             scancode::Linux::KeyLeftMeta,
         ] {
-            assert!(evdev_is_modifier(key as u32), "{key:?} should be a modifier");
+            assert!(
+                evdev_is_modifier(key as u32),
+                "{key:?} should be a modifier"
+            );
         }
         for key in [
             scancode::Linux::KeyA,
