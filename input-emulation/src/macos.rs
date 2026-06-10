@@ -699,9 +699,32 @@ fn key_event(event_source: CGEventSource, key: u16, state: u8, modifiers: XMods)
             return;
         }
     };
-    event.set_flags(to_cgevent_flags(modifiers));
+    event.set_flags(to_cgevent_flags(adjust_caps_shift(key, modifiers)));
     event.post(CGEventTapLocation::HID);
     log::trace!("key event: {key} {state}");
+}
+
+/// Real hardware resolves CapsLock+Shift+letter to lowercase, but for
+/// synthetic events the AlphaShift|Shift flag combination resolves to
+/// UPPERCASE (Shift wins — AlphaShift is just a flag here, not real
+/// caps state). When the caps latch and Shift are the only active
+/// modifiers and the key is a letter, drop both flags so the letter
+/// comes out lowercase. Shortcuts (any Cmd/Ctrl/Alt held) and
+/// non-letter keys (Shift+digit = symbol) are left untouched.
+fn adjust_caps_shift(key: u16, mods: XMods) -> XMods {
+    if mods == XMods::LockMask | XMods::ShiftMask && is_mac_letter_key(key) {
+        XMods::empty()
+    } else {
+        mods
+    }
+}
+
+/// The 26 ANSI letter virtual keycodes (kVK_ANSI_A..kVK_ANSI_Z).
+fn is_mac_letter_key(key: u16) -> bool {
+    matches!(
+        key,
+        0x00..=0x09 | 0x0b..=0x11 | 0x1f | 0x20 | 0x22 | 0x23 | 0x25 | 0x26 | 0x28 | 0x2d | 0x2e
+    )
 }
 
 fn modifier_event(event_source: CGEventSource, depressed: XMods, key: Option<CGKeyCode>) {
@@ -1411,6 +1434,32 @@ mod tests {
         assert_eq!(
             side_button_route_for_bundle(BTN_LEFT, Some("com.google.Chrome")),
             None
+        );
+    }
+
+    #[test]
+    fn caps_plus_shift_on_letters_resolves_to_lowercase() {
+        const KVK_ANSI_A: u16 = 0x00;
+        const KVK_ANSI_Z: u16 = 0x06;
+        const KVK_ANSI_1: u16 = 0x12;
+        let caps_shift = XMods::LockMask | XMods::ShiftMask;
+        // caps latch + shift on a letter: both flags dropped -> lowercase
+        assert_eq!(adjust_caps_shift(KVK_ANSI_A, caps_shift), XMods::empty());
+        assert_eq!(adjust_caps_shift(KVK_ANSI_Z, caps_shift), XMods::empty());
+        // shift+digit must keep shift (symbols), caps or not
+        assert_eq!(adjust_caps_shift(KVK_ANSI_1, caps_shift), caps_shift);
+        // shortcuts with other modifiers are untouched
+        let with_cmd = caps_shift | XMods::Mod4Mask;
+        assert_eq!(adjust_caps_shift(KVK_ANSI_A, with_cmd), with_cmd);
+        // plain shift (no caps latch) is untouched -> uppercase as usual
+        assert_eq!(
+            adjust_caps_shift(KVK_ANSI_A, XMods::ShiftMask),
+            XMods::ShiftMask
+        );
+        // caps latch alone is untouched -> uppercase
+        assert_eq!(
+            adjust_caps_shift(KVK_ANSI_A, XMods::LockMask),
+            XMods::LockMask
         );
     }
 
