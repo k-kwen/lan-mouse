@@ -568,7 +568,13 @@ impl CaptureTask {
                 return Ok(());
             }
             debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
-            capture.release().await?;
+            // Full teardown, not just a backend release: leaving
+            // active_client/state set means the next crossing into the
+            // same client skips the WaitingForAck transition and sends
+            // Input without Enter retransmission or Ack gating.
+            // notify_peer_of_leave only logs send failures, so this is
+            // safe even though the transport just errored.
+            self.release_capture(capture).await?;
             return Ok(());
         }
 
