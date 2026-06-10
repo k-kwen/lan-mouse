@@ -1172,21 +1172,32 @@ impl Emulation for MacOSEmulation {
                 }
                 KeyboardEvent::Modifiers {
                     depressed,
-                    latched,
-                    locked,
-                    group,
+                    latched: _,
+                    locked: _,
+                    group: _,
                 } => {
                     let prev = self.modifier_state.get();
-                    set_modifiers(&self.modifier_state, depressed, latched, locked, group);
-                    let new = self.modifier_state.get();
-                    // Only post a FlagsChanged when the absolute resync
-                    // actually changes state — i.e. when it heals a stuck
-                    // modifier. The Windows capture sends a resync before
-                    // EVERY modifier transition, so an unconditional post
-                    // injects a keycode-less FlagsChanged between right-
-                    // Option down and up, breaking the bare-tap detection
-                    // the downstream IME toggle relies on.
+                    let resync = XMods::from_bits(depressed).unwrap_or_default();
+                    // Subtractive-only: the resync may be stale — it is
+                    // sent BEFORE the transition it precedes, and UDP can
+                    // deliver it after that key event, so letting it SET a
+                    // modifier re-poisons state right after a legitimate
+                    // release (stuck Cmd after Cmd+C/V). Clearing-only
+                    // still heals every stuck case (stuck = we hold a bit
+                    // the sender's ground truth lacks); a lost key-DOWN is
+                    // deliberately not restored. Restrict to the bits the
+                    // sender actually tracks so e.g. a held CapsLock isn't
+                    // clobbered.
+                    let resyncable =
+                        XMods::ShiftMask | XMods::ControlMask | XMods::Mod1Mask | XMods::Mod4Mask;
+                    let new = prev - (resyncable - resync);
+                    // Only post a FlagsChanged when this actually heals a
+                    // stuck modifier: the resync precedes EVERY modifier
+                    // transition, and an unconditional keycode-less post
+                    // between right-Option down and up breaks the bare-tap
+                    // detection the downstream IME toggle relies on.
                     if new != prev {
+                        self.modifier_state.set(new);
                         modifier_event(self.event_source.clone(), new, None);
                     }
                     // This absolute resync is authoritative; refresh the idle
@@ -1281,22 +1292,6 @@ fn update_modifiers(modifiers: &Cell<XMods>, key: u32, state: u8) -> bool {
     } else {
         false
     }
-}
-
-fn set_modifiers(
-    active_modifiers: &Cell<XMods>,
-    depressed: u32,
-    latched: u32,
-    locked: u32,
-    group: u32,
-) {
-    let depressed = XMods::from_bits(depressed).unwrap_or_default();
-    let _latched = XMods::from_bits(latched).unwrap_or_default();
-    let _locked = XMods::from_bits(locked).unwrap_or_default();
-    let _group = XMods::from_bits(group).unwrap_or_default();
-
-    // we only care about the depressed modifiers for now
-    active_modifiers.replace(depressed);
 }
 
 fn to_cgevent_flags(depressed: XMods) -> CGEventFlags {
