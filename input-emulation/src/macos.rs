@@ -151,8 +151,12 @@ impl MacOSEmulation {
                     }
                 }
             }
-            // release key when cancelled
-            update_modifiers(&modifiers, key as u32, 0);
+            // Release key when cancelled. No update_modifiers here:
+            // `key` is a macOS virtual keycode, but update_modifiers
+            // expects evdev — e.g. macOS Down (125) parses as Linux
+            // KeyLeftMeta (125) and would strip a genuinely held Cmd
+            // from the modifier state. Modifier keys never reach the
+            // repeat task anyway (consume() returns early for them).
             key_event(event_source.clone(), key, 0, modifiers.get());
         });
         self.repeat_task = Some(repeat_task);
