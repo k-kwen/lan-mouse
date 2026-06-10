@@ -1176,8 +1176,19 @@ impl Emulation for MacOSEmulation {
                     locked,
                     group,
                 } => {
+                    let prev = self.modifier_state.get();
                     set_modifiers(&self.modifier_state, depressed, latched, locked, group);
-                    modifier_event(self.event_source.clone(), self.modifier_state.get(), None);
+                    let new = self.modifier_state.get();
+                    // Only post a FlagsChanged when the absolute resync
+                    // actually changes state — i.e. when it heals a stuck
+                    // modifier. The Windows capture sends a resync before
+                    // EVERY modifier transition, so an unconditional post
+                    // injects a keycode-less FlagsChanged between right-
+                    // Option down and up, breaking the bare-tap detection
+                    // the downstream IME toggle relies on.
+                    if new != prev {
+                        modifier_event(self.event_source.clone(), new, None);
+                    }
                     // This absolute resync is authoritative; refresh the idle
                     // clock so an immediately-following `Key` (e.g. the Windows
                     // capture sends `Modifiers` right before each modifier key)
