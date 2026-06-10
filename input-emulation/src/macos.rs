@@ -79,6 +79,10 @@ pub(crate) struct MacOSEmulation {
     /// gap after which still-held state is likely stranded (a release lost
     /// over UDP) and should be self-healed before the next key.
     last_keyboard_event: Option<Instant>,
+    /// whether the remote CapsLock key is physically held right now.
+    /// Used for edge detection: Windows auto-repeat delivers repeated
+    /// key-downs while held, and each must NOT re-toggle the latch.
+    caps_lock_down: bool,
 }
 
 /// Maps an evdev button code to the CGEventType used for drag events.
@@ -110,6 +114,7 @@ impl MacOSEmulation {
             notify_repeat_task: Arc::new(Notify::new()),
             modifier_state: Rc::new(Cell::new(XMods::empty())),
             last_keyboard_event: None,
+            caps_lock_down: false,
         })
     }
 
@@ -1091,12 +1096,14 @@ impl Emulation for MacOSEmulation {
                     self.last_keyboard_event = Some(now);
                     if idle {
                         self.cancel_repeat_task().await;
-                        if state == 1
-                            && evdev_is_modifier(key)
-                            && !self.modifier_state.get().is_empty()
-                        {
-                            self.modifier_state.set(XMods::empty());
-                            modifier_event(self.event_source.clone(), XMods::empty(), None);
+                        // LockMask is exempt from the stale-clear: it is an
+                        // intentional CapsLock toggle latch (set below), not
+                        // a held key whose release could have been lost.
+                        let stale = self.modifier_state.get() - XMods::LockMask;
+                        if state == 1 && evdev_is_modifier(key) && !stale.is_empty() {
+                            let kept = self.modifier_state.get() & XMods::LockMask;
+                            self.modifier_state.set(kept);
+                            modifier_event(self.event_source.clone(), kept, None);
                         }
                     }
                     // System-shortcut function keys: macOS rejects CGEvent-
@@ -1155,6 +1162,27 @@ impl Emulation for MacOSEmulation {
                         }
                     };
                     log::trace!("key event: evdev={key} -> macos={code} (state={state})");
+                    // CapsLock acts as a toggle latch, not a momentary
+                    // modifier: synthetic FlagsChanged cannot flip the
+                    // real macOS caps state, so we keep LockMask latched
+                    // across taps and stamp AlphaShift onto every
+                    // remote-typed key while it's on. Key-up never
+                    // toggles, and auto-repeat downs while held are
+                    // ignored via edge detection.
+                    if key == scancode::Linux::KeyCapsLock as u32 {
+                        match state {
+                            1 if !self.caps_lock_down => {
+                                self.caps_lock_down = true;
+                                let mods = self.modifier_state.get() ^ XMods::LockMask;
+                                self.modifier_state.set(mods);
+                                modifier_event(self.event_source.clone(), mods, Some(code));
+                                log::debug!("caps-lock latch toggled: {mods:?}");
+                            }
+                            0 => self.caps_lock_down = false,
+                            _ => {}
+                        }
+                        return Ok(());
+                    }
                     let is_modifier = update_modifiers(&self.modifier_state, key, state);
                     if is_modifier {
                         modifier_event(
