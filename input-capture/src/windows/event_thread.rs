@@ -9,10 +9,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::error::TrySendError;
-use windows::Win32::Foundation::{FALSE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{FALSE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     DEVMODEW, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISPLAY_DEVICEW, ENUM_CURRENT_SETTINGS,
-    EnumDisplayDevicesW, EnumDisplaySettingsW,
+    EnumDisplayDevicesW, EnumDisplaySettingsW, MONITOR_DEFAULTTONEAREST, MonitorFromPoint,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::RemoteDesktop::{
@@ -21,18 +21,22 @@ use windows::Win32::System::RemoteDesktop::{
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::core::{PCWSTR, w};
 
+use windows::Win32::UI::HiDpi::{
+    GetAwarenessFromDpiAwarenessContext, GetDpiForMonitor, GetDpiForSystem,
+    GetThreadDpiAwarenessContext, MDT_EFFECTIVE_DPI,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
     KEYEVENTF_SCANCODE, SendInput,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DispatchMessageW, EDD_GET_DEVICE_INTERFACE_NAME, GetMessageW,
-    HOOKPROC, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, PostThreadMessageW,
-    RegisterClassW, SetWindowsHookExW, TranslateMessage, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_STYLE,
-    WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WM_WTSSESSION_CHANGE, WM_XBUTTONDOWN, WM_XBUTTONUP,
-    WNDCLASSW, WNDPROC, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
+    CallNextHookEx, CreateWindowExW, DispatchMessageW, EDD_GET_DEVICE_INTERFACE_NAME, GetCursorPos,
+    GetMessageW, HOOKPROC, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT,
+    PostThreadMessageW, RegisterClassW, SetWindowsHookExW, TranslateMessage, WH_KEYBOARD_LL,
+    WH_MOUSE_LL, WINDOW_STYLE, WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WM_WTSSESSION_CHANGE,
+    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WNDPROC, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
 };
 
 use input_event::{
@@ -145,9 +149,11 @@ thread_local! {
     /// capture task, we synthesize local key-ups before passing
     /// events back to Windows.
     static HELD_MODIFIERS: RefCell<HashSet<Linux>> = RefCell::new(HashSet::new());
+    static DIAG_MOTION_LOGS_LEFT: Cell<u8> = const { Cell::new(0) };
 }
 
 static AUTO_RELEASE_BLOCKING_SEND_PENDING: AtomicBool = AtomicBool::new(false);
+const DIAG_MOTION_LOG_LIMIT: u8 = 8;
 
 fn get_msg() -> Option<MSG> {
     unsafe {
@@ -384,15 +390,35 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
     /* update active client and entry point */
     ACTIVE_CLIENT.replace(Some(pos));
 
-    // The activation event is passed through below, so Windows freezes the
-    // cursor at curr_pos once subsequent captured events are swallowed.
-    // ENTRY_POINT is the motion-delta baseline and must match that real
-    // frozen position, not the clamped landing coordinate.
-    ENTRY_POINT.replace(curr_pos);
+    // The activation event is passed through below, but Windows clamps the OS
+    // cursor to the virtual desktop before subsequent captured events are
+    // swallowed. Keep the motion-delta baseline in the same coordinate space
+    // as the low-level hook pt values and clamp only to the virtual desktop
+    // union, not to GetCursorPos's DPI-virtualized coordinates.
+    let entry_point = DISPLAYS.with_borrow(|(displays, _)| {
+        display_union(displays)
+            .map(|rect| clamp_to_rect(rect, curr_pos))
+            .unwrap_or(curr_pos)
+    });
+    ENTRY_POINT.replace(entry_point);
 
     let landing_point = DISPLAYS.with_borrow(|(displays, _)| {
         display_util::clamp_to_display_bounds(displays, prev_pos, curr_pos)
     });
+
+    DIAG_MOTION_LOGS_LEFT.set(DIAG_MOTION_LOG_LIMIT);
+    if log::log_enabled!(log::Level::Debug) {
+        DISPLAYS.with_borrow(|(displays, generation)| {
+            log_activation_diagnostics(
+                pos,
+                prev_pos,
+                curr_pos,
+                landing_point,
+                displays,
+                *generation,
+            );
+        });
+    }
 
     /* notify main thread */
     log::debug!("ENTERED @ {prev_pos:?} -> {curr_pos:?}");
@@ -664,6 +690,93 @@ unsafe extern "system" fn window_proc(
 
 static DISPLAY_RESOLUTION_GENERATION: AtomicI32 = AtomicI32::new(1);
 
+fn cursor_pos_snapshot() -> Option<(i32, i32)> {
+    unsafe {
+        let mut point: POINT = std::mem::zeroed();
+        GetCursorPos(&mut point).ok().map(|_| (point.x, point.y))
+    }
+}
+
+fn display_union(displays: &[RECT]) -> Option<RECT> {
+    let first = displays.first()?;
+    Some(displays.iter().skip(1).fold(*first, |mut acc, rect| {
+        acc.left = acc.left.min(rect.left);
+        acc.top = acc.top.min(rect.top);
+        acc.right = acc.right.max(rect.right);
+        acc.bottom = acc.bottom.max(rect.bottom);
+        acc
+    }))
+}
+
+fn clamp_to_rect(rect: RECT, point: (i32, i32)) -> (i32, i32) {
+    let (x, y) = point;
+    (
+        x.clamp(rect.left, rect.right - 1),
+        y.clamp(rect.top, rect.bottom - 1),
+    )
+}
+
+fn rect_center(rect: RECT) -> POINT {
+    POINT {
+        x: rect.left + (rect.right - rect.left) / 2,
+        y: rect.top + (rect.bottom - rect.top) / 2,
+    }
+}
+
+fn log_activation_diagnostics(
+    pos: Position,
+    prev_pos: (i32, i32),
+    curr_pos: (i32, i32),
+    landing_point: (i32, i32),
+    displays: &[RECT],
+    display_generation: i32,
+) {
+    let entry_point = ENTRY_POINT.get();
+    let cursor_pos_pre_pass = cursor_pos_snapshot();
+    let union = display_union(displays);
+    let union_clamped = union.map(|rect| clamp_to_rect(rect, curr_pos));
+
+    log::debug!(
+        "drift-diagnostic activation: pos={pos:?} prev={prev_pos:?} curr={curr_pos:?} \
+         entry={entry_point:?} landing_source_display={landing_point:?} \
+         cursor_pre_pass={cursor_pos_pre_pass:?} display_generation={display_generation} \
+         union={union:?} union_clamped={union_clamped:?} displays={displays:?}",
+    );
+    log_dpi_diagnostics(displays);
+}
+
+fn log_dpi_diagnostics(displays: &[RECT]) {
+    unsafe {
+        let context = GetThreadDpiAwarenessContext();
+        let awareness = GetAwarenessFromDpiAwarenessContext(context);
+        let system_dpi = GetDpiForSystem();
+        log::debug!(
+            "drift-diagnostic dpi: thread_context={:?} awareness={} system_dpi={}",
+            context.0,
+            awareness.0,
+            system_dpi
+        );
+
+        for (index, rect) in displays.iter().copied().enumerate() {
+            let monitor = MonitorFromPoint(rect_center(rect), MONITOR_DEFAULTTONEAREST);
+            let mut dpi_x = 0;
+            let mut dpi_y = 0;
+            match GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) {
+                Ok(()) => log::debug!(
+                    "drift-diagnostic dpi display[{index}]: rect={rect:?} monitor={:?} \
+                     effective_dpi=({dpi_x},{dpi_y})",
+                    monitor.0
+                ),
+                Err(error) => log::debug!(
+                    "drift-diagnostic dpi display[{index}]: rect={rect:?} monitor={:?} \
+                     effective_dpi_error={error}",
+                    monitor.0
+                ),
+            }
+        }
+    }
+}
+
 fn update_display_regions(displays: &mut Vec<RECT>, generation: &mut i32) {
     let global_generation = DISPLAY_RESOLUTION_GENERATION.load(Ordering::Acquire);
     if *generation != global_generation {
@@ -821,6 +934,18 @@ fn to_mouse_event(wparam: WPARAM, lparam: LPARAM) -> Option<PointerEvent> {
             // Do NOT advance ENTRY_POINT per event: that emits
             // delta-of-deltas and breaks motion.
             let (dx, dy) = (x - ex, y - ey);
+            if log::log_enabled!(log::Level::Debug) {
+                let logs_left = DIAG_MOTION_LOGS_LEFT.get();
+                if logs_left > 0 {
+                    let motion_index = DIAG_MOTION_LOG_LIMIT - logs_left + 1;
+                    DIAG_MOTION_LOGS_LEFT.set(logs_left - 1);
+                    let cursor_pos = cursor_pos_snapshot();
+                    log::debug!(
+                        "drift-diagnostic motion[{motion_index}]: pt=({x},{y}) \
+                         cursor_frozen={cursor_pos:?} entry=({ex},{ey}) dxdy=({dx},{dy})"
+                    );
+                }
+            }
             let (dx, dy) = (dx as f64, dy as f64);
             Some(PointerEvent::Motion { time: 0, dx, dy })
         }
